@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>frs — fake Rust compiler (browser demo)</title>
+<style>
+  body { font-family: monospace; background: #111; color: #eee; margin: 0; padding: 16px; }
+  h1 { font-size: 18px; }
+  #src { width: 100%; height: 260px; background: #1c1c1c; color: #eee; border: 1px solid #444; }
+  #run { padding: 8px 16px; margin: 8px 0; cursor: pointer; }
+  pre { background: #000; padding: 12px; white-space: pre-wrap; border: 1px solid #333; min-height: 120px; }
+  .ok { color: #7f7; } .err { color: #f77; }
+</style>
+</head>
+<body>
+<h1>frs — fake rustc in pure JS (runs 100% in this page, no server)</h1>
+<textarea id="src">fn main() {
+    let x: i32 = 5;
+    println!("hello {}", x);
+    for i in 0..3 {
+        println!("i = {}", i);
+    }
+}</textarea><br>
+<button id="run">Compile + Run (frs)</button>
+<pre id="out">output appears here…</pre>
+<script src="src/util.js"></script>
+<script src="src/lexer.js"></script>
+<script src="src/diagnostics.js"></script>
+<script src="src/rules.js"></script>
+<script src="src/checker.js"></script>
+<script src="src/interpreter.js"></script>
+<script src="src/frs.js"></script>
+<script>
+  document.getElementById('run').onclick = function () {
+    var src = document.getElementById('src').value;
+    var res = FRS.compile(src, { file: 'main.rs', run: true });
+    var el = document.getElementById('out');
+    var txt = '';
+    if (res.stderr) txt += res.stderr + '\n';
+    if (res.runStderr) txt += res.runStderr + '\n';
+    if (res.compileOk && !res.runStderr) txt += '--- program output ---\n' + res.stdout;
+    if (!txt) txt = '(no output)';
+    el.textContent = txt + '\n[' + (res.success ? 'OK' : 'FAIL') + ' in ' + res.timeMs.toFixed(2) + 'ms]';
+    el.className = res.success ? 'ok' : 'err';
+  };
+</script>
+</body>
+</html>

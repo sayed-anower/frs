@@ -1,0 +1,16 @@
+{
+  "name": "frs",
+  "version": "0.1.0",
+  "description": "frs — extreme-fast fake Rust compiler in pure JavaScript (syntax check + rustc-like errors + fake run output). Zero dependencies.",
+  "type": "commonjs",
+  "main": "src/frs.js",
+  "bin": {
+    "frs": "./bin/frs"
+  },
+  "scripts": {
+    "test": "node tests/run.js",
+    "demo": "node bin/frs.js examples/hello.rs"
+  },
+  "license": "MIT",
+  "dependencies": {}
+}
