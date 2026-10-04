@@ -11,7 +11,7 @@
   // Token kinds as small ints (fast compare). v = raw text.
   var T = {
     IDENT: 1, NUMBER: 2, STRING: 3, CHAR: 4,
-    SYMBOL: 5, LIFETIME: 6, RAWSTR: 7
+    SYMBOL: 5, LIFETIME: 6, RAWSTR: 7, BYTESTR: 8
   };
 
   // Multi-char symbols are matched by charCode dispatch in the hot loop below
@@ -245,7 +245,25 @@
           else if (cc2 > 127) { i++; col++; } // unicode ident char (approx)
           else break;
         }
-        push(T.IDENT, src.slice(b0, i), b0, bl, bc);
+        var identTok = src.slice(b0, i);
+        // byte string: b"..." right after a lone `b` (no space)
+        if (identTok === 'b' && i < n && src.charCodeAt(i) === 34) {
+          var bs0 = b0, bsEsc = false, bsTerm = false;
+          i++; col++;
+          while (i < n) {
+            var bd = src.charCodeAt(i);
+            if (bd === 10) break;
+            if (bsEsc) { bsEsc = false; i++; col++; continue; }
+            if (bd === 92) { bsEsc = true; i++; col++; continue; }
+            if (bd === 34) { bsTerm = true; i++; col++; break; }
+            i++; col++;
+          }
+          var bsRaw = src.slice(bs0, i);
+          push(T.BYTESTR, bsRaw, bs0, bl, bc);
+          if (!bsTerm) errs.push({ kind: 'unterminated-string', idx: bs0, line: bl, col: bc });
+          continue;
+        }
+        push(T.IDENT, identTok, b0, bl, bc);
         continue;
       }
 

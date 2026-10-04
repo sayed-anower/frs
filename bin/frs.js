@@ -80,8 +80,16 @@ function main(argv) {
     }
     if (res.stdout) process.stdout.write(res.stdout);
   }
+  if (res.serve) {
+    process.exitCode = res.compileOk ? 0 : 1;
+    return res.exitCode;
+  }
   return res.compileOk && !res.runStderr ? 0 : (res.compileOk ? 101 : 1);
 }
 
 var _code = main(process.argv);
-if (_code !== undefined) process.exit(_code);
+try { process.stdout.write(''); process.stderr.write(''); } catch (e) {}
+var _keepServing = false;
+try { _keepServing = global.__frsServerRunning === true; } catch (e) {}
+if (!_keepServing && _code !== undefined) process.exit(_code);
+if (_keepServing) process.exitCode = _code || 0;

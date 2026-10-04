@@ -13,8 +13,9 @@
   var NET_X = null;
   try { NET_X = (typeof require !== 'undefined') ? require('net') : null; } catch (e) { NET_X = null; }
   var TCP_SRVS = [];
+  var NET_LISTENING = false;
   U = U || {}; LEX = LEX || {};
-  var T = (LEX.T || { IDENT: 1, NUMBER: 2, STRING: 3, CHAR: 4, SYMBOL: 5, LIFETIME: 6, RAWSTR: 7 });
+  var T = (LEX.T || { IDENT: 1, NUMBER: 2, STRING: 3, CHAR: 4, SYMBOL: 5, LIFETIME: 6, RAWSTR: 7, BYTESTR: 8 });
 
   var MAX_STEPS = 200000;
   var MAX_LOOP = 10000;
@@ -106,15 +107,17 @@
       else throw e;
     }
     for (var oi = 0; oi < openFds.length; oi++) { try { FS_X && FS_X.closeSync(openFds[oi]); } catch (eO) {} }
-    for (var si = 0; si < TCP_SRVS.length; si++) { try { TCP_SRVS[si].close(); } catch (eS) {} }
+    if (!NET_LISTENING) { for (var si = 0; si < TCP_SRVS.length; si++) { try { TCP_SRVS[si].close(); } catch (eS) {} } }
 
     var out = stdout.join('');
+    var serving = NET_LISTENING;
     if (out.length > MAX_OUT) out = out.slice(0, MAX_OUT);
     return {
       stdout: out,
       stderr: stderr.join(''),
       panicked: panicked, // {msg, line, col}
-      env: env
+      env: env,
+      serve: serving
     };
   }
 
@@ -911,6 +914,12 @@
       var ainner = toks.slice(1, -1);
       var aparts = splitArgs(ainner);
       var aitems = [];
+      if (aparts.length === 2 && ainner.length && topIndex(ainner, ';') !== -1) {
+        var repv = Math.min(MAX_LOOP, Math.max(0, Math.floor(num(evalExpr(aparts[1], env, fns, st).value))));
+        var repb = evalExpr(aparts[0], env, fns, st).value;
+        for (var ai2 = 0; ai2 < repv; ai2++) aitems.push(repb);
+        return { value: { __rust: 'vec', items: aitems }, type: 'Vec<_>' };
+      }
       for (var ai = 0; ai < aparts.length; ai++) {
         if (!aparts[ai].length) continue;
         aitems.push(evalExpr(aparts[ai], env, fns, st).value);
@@ -958,6 +967,30 @@
       }
       return { value: tval, type: 'unknown' };
     }
+    // slice / index: expr[..b] / expr[a..b] / expr[i] / expr[a..=b]
+    var brC = -1;
+    for (var sp0 = 0; sp0 < toks.length; sp0++) {
+      if (toks[sp0].v === '[' && sp0 > 0) { brC = sp0; break; }
+    }
+    if (brC !== -1 && toks.length && toks[toks.length - 1].v === ']') {
+      var sBaseToks = toks.slice(0, brC);
+      var sBaseVal = evalExpr(sBaseToks, env, fns, st).value;
+      var sIn = toks.slice(brC + 1, toks.length - 1);
+      var sidx = -1;
+      for (var jj = 0; jj < sIn.length; jj++) { if (sIn[jj].v === '..') { sidx = jj; break; } }
+      var sItems = (sBaseVal !== null && typeof sBaseVal === 'object' && sBaseVal.__rust === 'vec') ? sBaseVal.items : (typeof sBaseVal === 'string' ? sBaseVal.split('') : []);
+      var slo = 0, shi = sItems.length, sincl = false;
+      if (sidx === -1) {
+        var sv = Math.floor(num(evalExpr(sIn, env, fns, st).value));
+        return { value: sv >= 0 && sv < sItems.length ? sItems[sv] : 0, type: 'unknown' };
+      }
+      if (sidx > 0) slo = Math.floor(num(evalExpr(sIn.slice(0, sidx), env, fns, st).value));
+      var srhs = sIn.slice(sidx + 1);
+      if (srhs.length && srhs[0].v === '=') { sincl = true; srhs = srhs.slice(1); }
+      if (srhs.length) shi = Math.floor(num(evalExpr(srhs, env, fns, st).value)) + (sincl ? 1 : 0);
+      return { value: { __rust: 'vec', items: sItems.slice(slo, shi) }, type: '&[_]' };
+    }
+
     // function call f(...)
     if (toks.length >= 2 && toks[0].t === T.IDENT && toks[1].v === '(' && !isKw(toks[0].v)) {
       var ce = matchTok(toks, 1, '(', ')');
@@ -1032,6 +1065,65 @@
         }
         return { value: 0, type: 'unknown' };
       }
+      // OpenOptions chain
+      if (base && typeof base === 'object' && base.__rust === 'openoptions' && FS_X) {
+        var o_append = base._append === true;
+        if (mname === 'append') { base._append = !!margVals[0]; return { value: base, type: 'OpenOptions' }; }
+        if (mname === 'truncate') { base._truncate = !!margVals[0]; return { value: base, type: 'OpenOptions' }; }
+        if (mname === 'open') {
+          var o_path = (splitArgs(margs).filter(function (a) { return a.length; })[0] || []);
+          var o_pv = o_path.length ? evalExpr(o_path, env, fns, st).value : '';
+          var o_flags = base._append ? 'a' : (base._truncate ? 'w' : 'r+');
+          try {
+            var o_fd = FS_X.openSync(String(o_pv), o_flags);
+            openFds.push(o_fd);
+            return { value: { __rust: 'result', ok: true, value: { __rust: 'file', _fd: o_fd, path: String(o_pv) } }, type: 'Result' };
+          } catch (eO) {
+            return { value: { __rust: 'result', ok: false, value: String(eO.message || eO) }, type: 'Result' };
+          }
+        }
+      }
+      // file/tcpstream read/write_all
+      if (mname === 'write_all' || mname === 'write') {
+        if (base && typeof base === 'object' && (base.__rust === 'file' || base.__rust === 'tcpstream')) {
+          var w_margs = splitArgs(margs).filter(function (a) { return a.length; })[0] || [];
+          var w_v = w_margs.length ? evalExpr(w_margs, env, fns, st).value : '';
+          var w_bytes;
+          if (w_v !== null && typeof w_v === 'object' && w_v.__rust === 'bytes') w_bytes = w_v.raw;
+          else if (w_v !== null && typeof w_v === 'object' && w_v.__rust === 'vec') w_bytes = Buffer.from(w_v.items.map(function (x) { return x | 0; }));
+          else w_bytes = String(w_v);
+          try {
+            if (base.__rust === 'file' && FS_X) FS_X.writeSync(base._fd, w_bytes);
+            else if (base.__rust === 'tcpstream' && typeof base._sock.write === 'function') base._sock.write(w_bytes);
+          } catch (eW) { return { value: { __rust: 'result', ok: false, value: String(eW.message || eW) }, type: 'Result' }; }
+          return { value: { __rust: 'result', ok: true, value: 0 }, type: 'Result' };
+        }
+      }
+      if (mname === 'read') {
+        if (base && typeof base === 'object' && (base.__rust === 'file' || base.__rust === 'tcpstream')) {
+          var rda = splitArgs(margs).filter(function (a) { return a.length; })[0] || [];
+          var rn = null;
+          for (var qx2 = 0; qx2 < rda.length; qx2++) { if (rda[qx2].t === T.IDENT && rda[qx2].v !== 'mut' && rda[qx2].v !== 'ref') { rn = rda[qx2].v; break; } }
+          var rbuf = rn ? ((env[rn] && env[rn].value && env[rn].value.__rust === 'vec') ? env[rn].value : null) : null;
+          var rbufitems = rbuf && rbuf.items ? rbuf.items : [];
+          var r_data = null;
+          if (base.__rust === 'file' && FS_X) {
+            try { r_data = FS_X.readSync(base._fd, Buffer.alloc(rbufitems.length || 1024), 0, rbufitems.length || 1024, null); } catch (eR) { r_data = null; }
+            if (r_data && typeof r_data.bytesRead === 'number') {
+              var rbr = Buffer.alloc(r_data.bytesRead);
+              (r_data.buffer || r_data).copy ? r_data.buffer.copy(rbr, 0, 0, r_data.bytesRead) : Buffer.from(r_data).copy(rbr, 0, 0, r_data.bytesRead);
+              r_data = rbr;
+            }
+          } else if (base.__rust === 'tcpstream') {
+            r_data = (base._chunk && base._chunk.length) ? base._chunk : Buffer.alloc(0);
+          }
+          var nRead = r_data && r_data.length ? Math.min(r_data.length, rbufitems.length || r_data.length) : 0;
+          if (rbuf && rbuf.items) {
+            for (var ri = 0; ri < nRead; ri++) { var bv2 = r_data[ri]; rbuf.items[ri] = Array.isArray(bv2) ? bv2[0] : (bv2 | 0); }
+          }
+          return { value: { __rust: 'result', ok: true, value: nRead }, type: 'Result' };
+        }
+      }
       // std::io real stdin buffer + buffer-arg write
       if (mname === 'read_line') {
         var btoklist = splitArgs(margs).filter(function (a) { return a.length; });
@@ -1051,7 +1143,7 @@
       }
       if ((mname === 'accept' || mname === 'incoming') && base && typeof base === 'object' && base.__rust === 'tcplistener') {
         if (mname === 'accept') return { value: { __rust: 'result', ok: false, value: 'would block' }, type: 'Result<(TcpStream, SocketAddr)>' };
-        return { value: { __rust: 'vec', items: [] }, type: 'Incoming<_>' };
+        return { value: { __rust: 'tcpincoming', _srv: base._srv }, type: 'Incoming<_>' };
       }
       if (mname === 'local_addr') return { value: { __rust: 'result', ok: true, value: '0.0.0.0:0' }, type: 'Result' };
       if (mname === 'lines' && base && typeof base === 'object' && base.__rust === 'bufreader' && FS_X) {
@@ -1153,6 +1245,7 @@
       var s = toks[0];
       if (s.t === T.NUMBER) return { value: parseRustNum(s.v), type: 'i32' };
       if (s.t === T.STRING || s.t === T.RAWSTR) return { value: unquote(s), type: '&str' };
+      if (s.t === T.BYTESTR) { var br2 = s.v; return { value: { __rust: 'bytes', raw: br2.slice(2, br2.length - 1) }, type: '&[u8]' }; }
       if (s.t === T.CHAR) return { value: unquoteChar(s.v), type: 'char' };
       if (s.t === T.IDENT) {
         if (s.v === 'true') return { value: true, type: 'bool' };
@@ -1344,6 +1437,15 @@
     if (mname === 'to_uppercase') return String(base).toUpperCase();
     if (mname === 'as_str') return rustToString(base);
     if (mname === 'as_secs') return base;
+    if (mname === 'as_bytes') return { __rust: 'bytes', raw: rustToString(base) };
+    if (mname === 'starts_with') return String(base).indexOf(String(margVals[0] || '')) === 0;
+    if (mname === 'ends_with') { var es = String(base); var ew = String(margVals[0] || ''); return es.slice(es.length - ew.length) === ew; }
+    if (mname === 'push_str') return base;
+    if (mname === 'get' && base !== null && typeof base === 'object' && base.__rust === 'vec') {
+      var gi = margVals[0] | 0;
+      return gi >= 0 && gi < base.items.length ? base.items[gi] : 0;
+    }
+    if (mname === 'into') return rustToString(base) && base;
     if (mname === 'split') { var p = base.split(String(margVals[0] || ',')); return { __rust: 'vec', items: p }; }
     if (mname === 'split_whitespace') { var q = String(base).split(/\s+/).filter(Boolean); return { __rust: 'vec', items: q }; }
     if (mname === 'join') {
@@ -1460,6 +1562,25 @@
       }
       if (typeName === 'io' && methodName === 'stdin') return { value: { __rust: 'stdin' }, type: 'Stdin' };
       if (typeName === 'io' && methodName === 'stdout') return { value: { __rust: 'stdout' }, type: 'Stdout' };
+    }
+    if (typeName === 'OpenOptions' && methodName === 'new') {
+      return { value: { __rust: 'openoptions', _append: false, _truncate: false }, type: 'OpenOptions' };
+    }
+    if (typeName === 'String' && (methodName === 'from_utf8_lossy' || methodName === 'from_utf8' || methodName === 'from_utf8_unchecked')) {
+      var fa = splitArgs(argToks).filter(function (a) { return a.length; });
+      if (fa.length) {
+        var fv = evalExpr(fa[0], env, fns, st).value;
+        var chars = '';
+        if (fv !== null && typeof fv === 'object' && fv.__rust === 'vec') {
+          chars = fv.items.map(function (x) { return String.fromCharCode(x); }).join('');
+        } else if (fv !== null && typeof fv === 'object' && fv.__rust === 'bytes') {
+          chars = fv.raw;
+        } else {
+          chars = rustToString(fv);
+        }
+        return { value: chars, type: 'Cow<str>' };
+      }
+      return { value: '', type: 'Cow<str>' };
     }
     if (methodName === 'new') {
       if (typeName === 'Vec' || typeName === 'VecDeque') {
@@ -1704,6 +1825,30 @@
     var iterVal;
     try { iterVal = evalExpr(iterToks.slice(), env, fns, st).value; }
     catch (e) { if (e && e.__frsPanic) throw e; iterVal = []; }
+    // real socket incoming loop
+    if (process.env && process.env.DBG) console.error('EXPR_ITER', iterVal && iterVal.__rust);
+    if (iterVal !== null && typeof iterVal === 'object' && iterVal.__rust === 'tcpincoming' && NET_X) {
+      NET_LISTENING = true;
+      var srvListen = iterVal._srv;
+      try {
+        srvListen.on('connection', function (sock) {
+          if (process.env && process.env.DBG) console.error('CONN EVENT');
+          var conn = { __rust: 'tcpstream', _sock: sock, _chunk: Buffer.alloc(0) };
+          sock.on('data', function (d) {
+            if (process.env && process.env.DBG) console.error('DATA EVENT', d.length);
+            conn._chunk = d;
+            var child = Object.create(env);
+            child[varName] = { value: { __rust: 'result', ok: true, value: conn }, type: 'unknown' };
+            if (process.env && process.env.DBG) console.error('EXEC BODY, bvars', body.length);
+            try { execBlock(body, child, fns, stdout, stderr, st); }
+            catch (eS) { if (process.env && process.env.DBG) console.error('BODYERR', eS && eS.msg); if (eS && eS.__frsPanic && process.stderr) process.stderr.write('thread panicked: ' + eS.msg + '\n'); }
+            if (process.env && process.env.DBG) console.error('BODY DONE, stdout buffer len', stdout.length);
+          });
+          sock.on('error', function () {});
+        });
+      } catch (eL) {}
+      return end + 1;
+    }
     var items = toItems(iterVal);
     var had = Object.prototype.hasOwnProperty.call(env, varName);
     var saved = env[varName];

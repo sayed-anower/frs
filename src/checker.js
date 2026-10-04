@@ -7,7 +7,7 @@
 }(typeof self !== 'undefined' ? self : this, function (U, LEX, RULES_MOD) {
   'use strict';
   U = U || {}; LEX = LEX || {}; RULES_MOD = RULES_MOD || {};
-  var T = (LEX.T || { IDENT: 1, NUMBER: 2, STRING: 3, CHAR: 4, SYMBOL: 5, LIFETIME: 6, RAWSTR: 7 });
+  var T = (LEX.T || { IDENT: 1, NUMBER: 2, STRING: 3, CHAR: 4, SYMBOL: 5, LIFETIME: 6, RAWSTR: 7, BYTESTR: 8 });
   var RULES = RULES_MOD.RULES || [];
   var KNOWN_TYPES = RULES_MOD.KNOWN_TYPES || {};
   var KNOWN_MACROS = RULES_MOD.KNOWN_MACROS || {};

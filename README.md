@@ -1,29 +1,41 @@
 # frs — extreme-fast fake Rust compiler in pure JavaScript
 
-`frs` doesn't really compile anything. It **checks** Rust code (syntax + simple
-types) and prints errors **exactly like `rustc`**, then **fakes the program
-output** (runs `println!`, `for`, `if`, `fn`, `vec!`, … in JS).
+`frs` doesn't compile to machine code. It **checks** Rust code (syntax + types)
+and prints errors **exactly like `rustc`**, then runs the program in a fake
+runtime that really executes `fs`, sockets and stdio **through Node.js**. No
+build steps, no native deps, no npm dependencies.
 
-- **Zero dependencies, pure JS** — runs in Node *and* browsers (`index.html` demo).
+- **Zero dependencies, pure JS** — runs in Node *and* browsers (`index.html`).
 - **Fast** — single-pass lexer + single-pass checker, `O(n)`, no regex in hot
   loops, int-enum tokens, precomputed line map, allocation-free rule pass.
 - **rustc-like output** — `error[E0308]: …`, `--> main.rs:2:5`, caret spans,
   `help:`/`note:`, abort footer, panic format, TTY colors.
 - **Rule table** — every check is one declarative entry in `src/rules.js`.
-  Adding a check = adding one object. Nothing else to touch.
+  Adding a check = adding one object.
+- **Cargo-like workflow** — `frs new/build/run/check`, real `Cargo.toml`
+  parsing, dependencies downloaded from crates.io, compiled and cached.
+- **Real side effects (Node only)** — `File::create/open`, `read_to_string`,
+  `writeln!(file, …)`, stdin `read_line`, TCP listeners (`TcpListener::bind`),
+  binary buffers via `b"…"` + `&[u8]`.
+
+## Layout
 
 ```
 frs/
   src/
     util.js         char tables, line map, colors
-    lexer.js        single-pass tokenizer (strings, chars, comments, numbers)
-    diagnostics.js rustc-style renderer
+    lexer.js        single-pass tokenizer (strings, chars, byte-strings,
+                    comments, numbers, ask: `b"..."` support)
+    diagnostics.js  rustc-style renderer
     rules.js        *** THE RULE TABLE — declare checks here ***
     checker.js      one-pass syntax+type checker, runs RULES
-    interpreter.js  fake runtime (println!/format!/vars/loops/fns/match)
+    interpreter.js  runtime (println!/format!/vars/loops/fns/match/impls/
+                    macros/fs/stdin/tcp)
     frs.js          core engine: compile(src, opts) -> {stderr, stdout, ...}
-  bin/frs(.js)      CLI (rustc-like flags)
-  examples/         hello.rs, error_demo.rs, advanced.rs
+    pm.js           cargo-like package manager (new/build/run/imports deps)
+  bin/frs(.js)      CLI (rustc-like flags + subcommands)
+  examples/         hello.rs, error_demo.rs, advanced.rs, web_server.rs,
+                    highly_advance.rs, extreme_advance.rs
   tests/run.js      zero-dep tests (`npm test`)
   index.html        browser demo (loads src/*.js via <script>)
 ```
@@ -42,7 +54,7 @@ As a library (Node):
 const FRS = require('./src/frs.js');
 const r = FRS.compile('fn main() { println!("hi {}", 1); }', { file: 'main.rs' });
 console.log(r.stderr);  // rustc-style errors ('' if clean)
-console.log(r.stdout);  // fake program output
+console.log(r.stdout);  // program output
 console.log(r.success, r.timeMs + 'ms');
 ```
 
@@ -62,7 +74,9 @@ In a browser:
 </script>
 ```
 
-Open `index.html` for a ready-made playground.
+Open `index.html` for a ready-made playground. In the browser there is no real
+filesystem/network — those calls degrade to `Err(..)` results, matching
+sandboxed environments.
 
 ## CLI
 
@@ -73,27 +87,29 @@ Usage: frs <file.rs> [options]
   --no-color     disable colors
   --no-warnings  hide warnings
   -o <file>      accepted for rustc-compat, ignored
+  --version      print version
 ```
 
 Exit codes: `0` clean run, `1` compile error, `101` runtime panic (like Rust).
 
-## Cargo-like package manager
+## Cargo-like package manager (`src/pm.js`)
 
 ```sh
 frs new <name>            # create a new project (Cargo.toml + src/main.rs)
 cd <name>
 frs check                 # syntax/type check only (no run)
-frs build                 # fetch + compile deps, then check the crate, cache in frs_target/
-frs run                   # does what `frs build` does, then runs src/main.rs
+frs build                 # fetch + compile deps, then check the crate
+frs run                   # build, then execute src/main.rs
 ```
 
 `[dependencies]` in `Cargo.toml` are downloaded from
-`https://crates.io/api/v1/crates/<name>/<version>` (needs network once per
-dep), extracted to `frs_target/registry/src/<name>-<version>/`, compiled
-(checked) with our own engine, and cached as `frs_target/deps/<name>-<version>.json`
-so they are not recompiled all the time. Version reqs support `"*"`, `"^1"`,
-`"1.2"`, `"=1.2.3"`. Build flags/messages and rerun-only-once behavior are
-cargo-flavored; the dependency resolver is intentionally simple but real.
+`https://crates.io/api/v1/crates/<name>/<version>/download` (one request per
+dep total, cached), extracted to `frs_target/registry/src/<name>-<version>/`,
+compiled (syntax/type checked by our own engine), and the artifact is cached as
+`frs_target/deps/<name>-<version>.json`. Re-runs reuse it (`Fresh` line).
+Version reqs support `"*"`, `"^1"`, `"1.2"`, `"=1.2.3"`. Features arrays are
+parsed and stored on the artifact. Build messages are cargo-flavored
+(`Downloading`, `Compiling`, `Finished`, `Running`).
 
 ## What it checks (current rules)
 
@@ -113,7 +129,7 @@ cargo-flavored; the dependency resolver is intentionally simple but real.
 | R018 | — | `->` without a return type |
 | R020 | — | unclosed `#[attr]` |
 | R021 | — | missing `fn main` (binary mode) + bad `main` args |
-| R022 | E0599 | *(reserved placeholder — struct-literal rule goes here)* |
+| R022 | E0599 | *(reserved placeholder)* |
 | T001/T002 | E0308 | `let x: T = v` / reassignment type mismatch |
 | T003 | E0384 | assign to immutable `let` (needs `mut`) |
 | T004 | E0425 | use of undeclared variable / unknown function |
@@ -125,22 +141,51 @@ cargo-flavored; the dependency resolver is intentionally simple but real.
 | W001/W002/W003 | — | unused var / unused fn / `mut` never mutated |
 
 Type inference is intentionally simple: literals (`5`→`int-lit` fits any int,
-`"…"`→`&str`, `'…'`→`char`, `true`→`bool`), `vec![…]`→`Vec<_>`,
+`"…"`→`&str`, `b"…"`→`&[u8]`, `'…'`→`char`, `true`→`bool`), `vec![…]`→`Vec<_>`,
 `format!`/`to_string`/`String::from`→`String`, plus one-level var lookup.
 Unknown types never error (no false positives on complex expressions).
 
-## Fake runtime support
+### Syntax it accepts
 
-`println!`/`print!`/`eprintln!`/`eprint!` (with `{}`, `{:?}`, `{:.2}`,
-positional `{0}`, named `{x}` + inline captures), `format!`, `vec![…]` /
-`vec![x; n]`, arrays, `String::from`/`.to_string()`/`.len()`/`.parse()`,
-integers/floats/bools/chars/strings, `+ - * / % == != < > && ||`,
-`&`/`!`/`-`, ranges `0..3`/`0..=3`, `if/else`, `for x in …`, `while`/`loop`
-(with `break`/`continue`, capped at 10k iters), `match` (literals/`_`/
-bindings/ranges/`Ok`/`Some`-style ctors), user `fn` (params, `return`,
-recursion via step cap), `panic!`/`assert*!`/`todo!`/`unreachable!`,
-`+= -= *= /= %=`. Output goes to `stdout`; panics render like
-`thread 'main' panicked at '…', main.rs:L:C`.
+`structures`: `struct`/`enum` (incl. fieldless + discriminants), `impl`/
+`trait` blocks, `type` aliases, `const`/`static`, `union`-less `mod` and
+`macro_rules!` blocks, attributes `#[..]`/`#![..]` (skipped, not code).
+
+`items inside fns`: `let`/patterns `let (a, b) = …`, `if let`/`while let`,
+destructuring match arms, struct literals `Self { .. }` / field init shorthand,
+closures `|x|`, `async`/`await` keywords pass through, raw strings `r#"…"#`,
+byte strings `b"…"`, nested `use` trees with braces/aliases, generics incl.
+`where` clauses, `<S: Type>` generics, lifetimes, `unsafe` blocks.
+
+### Runtime features (interpreter.js)
+
+(fake side effects where noted; *real* side effects run through Node)
+
+- Output: `println!`/`print!`/`eprintln!`/`eprint!` with `{}`, `{:?}`, `{:.2}`,
+  positional `{0}`, named `{x}`, inline captures.
+- Macros: `format!`, `vec![…]`, `vec![x; n]`, users `macro_rules!` (`$name:expr`
+  params, first-match-of-arity transcribers), `panic!`, `assert[_eq/_ne]`,
+  `todo!`, `unreachable!`.
+- Data: structs/enums/tuple structs, `Option`/`Result` created by constructors,
+  `Vec`, arrays incl. `[0; 1024]`, ranges, indexing `v[i]`, slices `v[..n]` /
+  `v[a..b]` / `v[a..=b]`.
+- Control: `if/else` (else-if chains), `match` with guard-less patterns,
+  `for`, `loop`, `while`, break/continue, `return`, recursion (step-capped).
+- Traits/impls: `Type::new`, `Type::method`, blanket shapes, `Self` rebash,
+  `Display` methods live as `Type::fmt` and are used indirectly.
+- Try: `?` on `Result`/`Option` (Err/None throws `__frsTryErr` and is returned
+  from the enclosing fn).
+- **fs (real)**: `File::create`, `File::open`, `OpenOptions::append/open`,
+  `fs::read_to_string`, `fs::write`, `fs::remove_file`, `write!`/`writeln!`
+  to files via fd, `BufReader::lines`.
+- **io (real)**: stdin (`io::stdin().read_line(&mut buf)`), stdout/stderr
+  printing, `io::stdout().flush()`.
+- **net (real)**: `TcpListener::bind("127.0.0.1:PORT")` starts a real Node
+  server; the loop body of `for stream in listener.incoming() { ... }` is
+  executed per connection; `accept`/`incoming`/`local_addr` supported;
+  `stream.read(&mut buf)` and `stream.write_all(b"..")` work on the socket.
+- **buffers (real)**: `b"..."` literals, `u8` arrays, `as_bytes()`,
+  `&[u8]` slicing, `String::from_utf8_lossy`.
 
 ## How to add a new rule (2 minutes)
 
@@ -152,7 +197,7 @@ the scan loop.
 
 ```js
 {
-  id: 'T020',            // your new id (R*=syntax, T*=type, W*=warning)
+  id: 'T020',            // R*=syntax, T*=type, W*=warning
   code: 'E0599',         // rustc code or null
   level: 'error',        // 'error' | 'warning'
   anchor: 'call',        // WHERE it runs (see table below)
@@ -174,20 +219,20 @@ the scan loop.
 | `macro` | a `name!(…)` node `{name, fmtStr, argCount, placeholders}` | format-string checks |
 | `keyword` | a `break`/`continue`/`return`/`else` node | context checks |
 
-**2. Implement the check** — either inline or as a `ctx.checkX` method in
-`src/checker.js` next to the others:
+**2. Implement the check** — inline or as a `ctx.checkX` method in
+`src/checker.js`:
 
 ```js
 ctx.checkNoFoo = function () {
   var n = ctx.current;
   if (n && n.name === 'foo') {
     return {
-      msg: 'do not call `foo`',          // after `error: `
-      line: n.line, col: n.col,           // span start
-      spanLen: n.name.length,             // caret width
-      label: 'forbidden call',            // after carets
-      hint: 'call `bar()` instead',       // `help: …` (optional)
-      // note: 'extra info',             // `note: …` (optional)
+      msg: 'do not call `foo`',
+      line: n.line, col: n.col,
+      spanLen: n.name.length,
+      label: 'forbidden call',
+      hint: 'call `bar()` instead',
+      // note: 'extra info',
     };
   }
   return null; // pass
@@ -204,22 +249,22 @@ ctx.toks, ctx.lets, ctx.assigns, ctx.calls, ctx.macros, ctx.kws
 ctx.fns          // {name: {params, ret, used, line, col, count}}
 ctx.structs      // user-defined type names
 ctx.identUses    // every variable read {name, idx, line, col}
-ctx.bindingFor(name, useIdx)   // latest `let` visible at a use (shadowing-aware)
-ctx.infer(valToks, byName, useIdx, structs) // -> 'i32' | '&str' | 'int-lit' | …
+ctx.bindingFor(name, useIdx)   // latest `let` visible at a use
+ctx.infer(valToks, byName, useIdx, structs) // -> 'i32'|'&str'|'int-lit'|…
 ctx.compat(ann, actual)        // generic-lit-aware equality
-ctx.stack        // leftover open delimiters; ctx.strayCloses for stray closers
-ctx.lexErrs      // lexer problems (unterminated string/comment/char)
-ctx.loopRanges / ctx.fnRanges  // token ranges (for break/return checks)
-ctx.insideRanges(ranges, idx)  // is a node inside a loop/fn body?
+ctx.stack / ctx.strayCloses
+ctx.lexErrs      // lexer problems
+ctx.loopRanges / ctx.fnRanges
+ctx.insideRanges(ranges, idx)
 ```
 
 **Performance rules** (keeps `frs` extreme-fast):
 
 - Return `null` on the fast path with zero allocation (compare cheap fields first).
-- Never regex/slice the source in `check` — use the pre-lexed `ctx.toks`.
-- `eof`-anchor rules run once; prefer `stmt`/`decl` anchors over re-scanning.
-- See `checker.js → applies()` — add your rule id there if it only applies to a
-  subset of its anchor's nodes (avoids useless calls).
+- Never regex/slice the source in `check` — use pre-lexed `ctx.toks`.
+- Prefer `stmt`/`decl` anchors over `eof` re-scans.
+- Add your rule id in `checker.js → applies()` if it only applies to a subset
+  of its anchor's nodes.
 
 **4. Test it** — add a line in `tests/run.js`:
 
@@ -229,22 +274,37 @@ t('no foo', 'fn main() { foo(); }', { ok: false, errContains: 'do not call `foo`
 
 ```sh
 npm test
-node bin/frs.js examples/error_demo.rs
 ```
 
-## Speed notes
+## Architecture notes (for contributors)
 
-- Lexer: one `charCodeAt` loop, table-driven char classes, `indexOf` fast-path
-  for raw strings, incremental line/col (no per-token binary search).
-- Checker: one token walk builds lets/assigns/calls/macros/ranges; each rule is
-  `O(nodes-of-its-anchor)`; diagnostics sorted once at the end.
-- Interpreter: statement splitter + Pratt-lite evaluator, capped steps/loops/
-  output so hostile inputs can't hang the page.
+- **Tokens** are `{ t, v, idx, line, col, pos }`; `t` is one of
+  `IDENT=1, NUMBER=2, STRING=3, CHAR=4, SYMBOL=5, LIFETIME=6, RAWSTR=7, BYTESTR=8`.
+- **Checker**: single token walk gathers `lets/assigns/calls/macros/kws/fns/
+  structs/loopRanges/fnRanges`, then runs RULES per anchor. Diagnostics are
+  sorted once emitted.
+- **Interpreter**: token-slice evaluator (`execBlock`/`execExprStmt`/`evalExpr`),
+  caps: `MAX_STEPS=200000`, `MAX_LOOP=10000`, `MAX_OUT=20000`. Method calls
+  on structs dispatch through `qns[Type::method]`; real-world side effects are
+  gated by `FS_X`/`NET_X` (`require('fs')`/`require('net')` under Node, `null`
+  in browsers).
+- **Package manager**: `src/pm.js` uses only `fs`, `path`, `https`,
+  `child_process` (for `tar -xzf`). All deps are checked by this same engine.
 
 ## Honest limitations
 
-This is a *fake* compiler: no borrow checker, no traits/generics resolution, no
-macros beyond the built-ins, and type inference is shallow by design (complex
-expressions yield `unknown` and pass). Error messages are simple on purpose —
-`expected X, found Y` + `help:` — not full rustc suggestions. Anything it can't
-prove is passed silently to avoid false positives.
+Fake compiler: shallow inference (complex exprs → `unknown` → pass), no borrow
+checker, traits are namespaced by `Type::method` only (no dynamic-dispatch
+trait objects), closures evaluate as names, async forms don't run, and hitting
+the step limit produces `thread 'main' panicked at 'frs: execution limit
+exceeded'`. Error messages match rustc in *shape*, but coverage is not 1:1.
+These are deliberate so users get rustc *feelings* without the Rust toolchain.
+
+## Contributing / Contact
+
+This project is `frs` under MIT — pull requests welcome.
+
+If something is missing (an enum pattern it can't use, a macro knot it chokes
+on, a dependency that won't get fetched, a wrong span), please try to fix it —
+a rule entry in `src/rules.js` plus a line in `tests/run.js` is most of the
+work. If you're not able to fix it yourself, contact us and we'll do it.

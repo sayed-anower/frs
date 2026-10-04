@@ -42,6 +42,7 @@
         success = false;
       }
     }
+    if (runRes && runRes.serve) { try { if (typeof global !== 'undefined') global.__frsServerRunning = true; } catch (e) {} }
     return {
       success: success && !runResPanicked(runRes),
       compileOk: rep.errCount === 0,
@@ -49,6 +50,7 @@
       stderr: stderr,
       stdout: stdout,
       runStderr: panicText,
+      serve: !!(runRes && runRes.serve),
       errCount: rep.errCount,
       warnCount: rep.warnCount,
       timeMs: now() - t0,
