@@ -912,19 +912,22 @@
     // array literal [...]
     if (toks[0].v === '[' && matchTok(toks, 0, '[', ']') === toks.length - 1) {
       var ainner = toks.slice(1, -1);
-      var aparts = splitArgs(ainner);
-      var aitems = [];
-      if (aparts.length === 2 && ainner.length && topIndex(ainner, ';') !== -1) {
-        var repv = Math.min(MAX_LOOP, Math.max(0, Math.floor(num(evalExpr(aparts[1], env, fns, st).value))));
-        var repb = evalExpr(aparts[0], env, fns, st).value;
+      var semiA = topIndex(ainner, ';');
+      if (semiA !== -1) {
+        // repeat form `[x; n]` (splitArgs only splits on `,`, so split on `;` here)
+        var repv = Math.min(MAX_LOOP, Math.max(0, Math.floor(num(evalExpr(ainner.slice(semiA + 1), env, fns, st).value))));
+        var repb = evalExpr(ainner.slice(0, semiA), env, fns, st).value;
+        var aitems = [];
         for (var ai2 = 0; ai2 < repv; ai2++) aitems.push(repb);
         return { value: { __rust: 'vec', items: aitems }, type: 'Vec<_>' };
       }
+      var aparts = splitArgs(ainner);
+      var aitems2 = [];
       for (var ai = 0; ai < aparts.length; ai++) {
         if (!aparts[ai].length) continue;
-        aitems.push(evalExpr(aparts[ai], env, fns, st).value);
+        aitems2.push(evalExpr(aparts[ai], env, fns, st).value);
       }
-      return { value: { __rust: 'vec', items: aitems }, type: 'Vec<_>' };
+      return { value: { __rust: 'vec', items: aitems2 }, type: 'Vec<_>' };
     }
     // struct literal: Name { x: 1, y } / Name { x: 1, ..base } -> field map
     if (toks.length >= 3 && toks[0].t === T.IDENT && toks[0].v[0] >= 'A' && toks[0].v[0] <= 'Z' &&
@@ -1068,8 +1071,8 @@
       // OpenOptions chain
       if (base && typeof base === 'object' && base.__rust === 'openoptions' && FS_X) {
         var o_append = base._append === true;
-        if (mname === 'append') { base._append = !!margVals[0]; return { value: base, type: 'OpenOptions' }; }
-        if (mname === 'truncate') { base._truncate = !!margVals[0]; return { value: base, type: 'OpenOptions' }; }
+        if (mname === 'append') { base._append = !!margVals[0]; if (dotCall.close < toks.length - 1) return finishMethodResult(base, toks.slice(dotCall.close + 1), env, fns, st); return { value: base, type: 'OpenOptions' }; }
+        if (mname === 'truncate') { base._truncate = !!margVals[0]; if (dotCall.close < toks.length - 1) return finishMethodResult(base, toks.slice(dotCall.close + 1), env, fns, st); return { value: base, type: 'OpenOptions' }; }
         if (mname === 'open') {
           var o_path = (splitArgs(margs).filter(function (a) { return a.length; })[0] || []);
           var o_pv = o_path.length ? evalExpr(o_path, env, fns, st).value : '';
@@ -1245,7 +1248,7 @@
       var s = toks[0];
       if (s.t === T.NUMBER) return { value: parseRustNum(s.v), type: 'i32' };
       if (s.t === T.STRING || s.t === T.RAWSTR) return { value: unquote(s), type: '&str' };
-      if (s.t === T.BYTESTR) { var br2 = s.v; return { value: { __rust: 'bytes', raw: br2.slice(2, br2.length - 1) }, type: '&[u8]' }; }
+      if (s.t === T.BYTESTR) { var br2 = s.v.slice(2, s.v.length - 1).replace(/\\n/g, '\n').replace(/\\t/g, '\t').replace(/\\r/g, '\r').replace(/\\"/g, '"').replace(/\\\\/g, '\\').replace(/\\0/g, '\0'); return { value: { __rust: 'bytes', raw: br2 }, type: '&[u8]' }; }
       if (s.t === T.CHAR) return { value: unquoteChar(s.v), type: 'char' };
       if (s.t === T.IDENT) {
         if (s.v === 'true') return { value: true, type: 'bool' };
@@ -1825,24 +1828,37 @@
     var iterVal;
     try { iterVal = evalExpr(iterToks.slice(), env, fns, st).value; }
     catch (e) { if (e && e.__frsPanic) throw e; iterVal = []; }
-    // real socket incoming loop
-    if (process.env && process.env.DBG) console.error('EXPR_ITER', iterVal && iterVal.__rust);
+    // real socket incoming loop (continuous server, pure Node.js net)
     if (iterVal !== null && typeof iterVal === 'object' && iterVal.__rust === 'tcpincoming' && NET_X) {
       NET_LISTENING = true;
       var srvListen = iterVal._srv;
       try {
+        srvListen.on('error', function (eL2) {
+          try { if (typeof process !== 'undefined' && process.stderr) process.stderr.write('error: failed to bind listener: ' + (eL2 && eL2.message || eL2) + '\n'); } catch (eI) {}
+        });
         srvListen.on('connection', function (sock) {
-          if (process.env && process.env.DBG) console.error('CONN EVENT');
           var conn = { __rust: 'tcpstream', _sock: sock, _chunk: Buffer.alloc(0) };
-          sock.on('data', function (d) {
-            if (process.env && process.env.DBG) console.error('DATA EVENT', d.length);
+          try { sock.setNoDelay && sock.setNoDelay(true); } catch (eN) {}
+          // one Rust `for stream in listener.incoming()` iteration == one connection.
+          // use `once` so a chunked request is handled exactly once, then close
+          // (mimics Rust dropping `stream` at end of loop body).
+          sock.once('data', function (d) {
             conn._chunk = d;
             var child = Object.create(env);
             child[varName] = { value: { __rust: 'result', ok: true, value: conn }, type: 'unknown' };
-            if (process.env && process.env.DBG) console.error('EXEC BODY, bvars', body.length);
+            var outMark = stdout.length, errMark = stderr.length;
             try { execBlock(body, child, fns, stdout, stderr, st); }
-            catch (eS) { if (process.env && process.env.DBG) console.error('BODYERR', eS && eS.msg); if (eS && eS.__frsPanic && process.stderr) process.stderr.write('thread panicked: ' + eS.msg + '\n'); }
-            if (process.env && process.env.DBG) console.error('BODY DONE, stdout buffer len', stdout.length);
+            catch (eS) { if (eS && eS.__frsPanic && process.stderr) { try { process.stderr.write('thread panicked: ' + eS.msg + '\n'); } catch (eW) {} } }
+            // live-flush any println!/eprintln! from this hit (run() already returned)
+            try {
+              if (typeof process !== 'undefined') {
+                if (stdout.length > outMark && process.stdout) process.stdout.write(stdout.slice(outMark).join(''));
+                if (stderr.length > errMark && process.stderr) process.stderr.write(stderr.slice(errMark).join(''));
+              }
+            } catch (eF) {}
+            // finish HTTP hit: flush socket write then end (so curl/browser completes)
+            try { sock.end(); } catch (eE) {}
+            try { setTimeout(function () { try { sock.destroy(); } catch (eD) {} }, 2000); } catch (eT) {}
           });
           sock.on('error', function () {});
         });
@@ -2002,6 +2018,14 @@
       if (pat[gi].t === T.IDENT && pat[gi].v === 'if') { g = gi; break; }
     }
     var core = g === -1 ? pat : pat.slice(0, g);
+    if (!core.length) return false;
+    // strip binding modifiers: `mut x`, `ref x`, `&x`, `&mut x`
+    var stripped = true;
+    while (stripped && core.length) {
+      stripped = false;
+      if (core[0].t === T.IDENT && (core[0].v === 'mut' || core[0].v === 'ref')) { core = core.slice(1); stripped = true; }
+      else if (core[0].v === '&') { core = core.slice(1); stripped = true; }
+    }
     if (!core.length) return false;
     if (core.length === 1 && core[0].v === '_') return true;
     // single token: literals, None, bare binding/ctor

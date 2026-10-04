@@ -66,12 +66,22 @@ function main(argv) {
   catch (e) { process.stderr.write('error: could not read file `' + file + '`\n'); return 1; }
 
   U.setColor(!noColor && process.stderr.isTTY && !process.env.NO_COLOR);
+  var showProgress = !process.env.FRS_NO_PROGRESS;
+  function pctLine(pct, label) {
+    if (!showProgress) return;
+    try { process.stderr.write('Compiling ' + pct + '% done' + (label ? ' (' + label + ')' : '') + '\n'); } catch (e) {}
+  }
+  pctLine(0, 'starting');
   var res = FRS.compile(src, {
     file: path.basename(file),
     lib: lib,
     run: !checkOnly,
-    warnings: !noWarn
+    warnings: !noWarn,
+    onProgress: function (pct, label) {
+      if (pct === 60 || pct === 80 || pct === 100) pctLine(pct, label);
+    }
   });
+  pctLine(100, 'done');
   if (res.stderr) process.stderr.write(res.stderr);
   if (res.compileOk && !checkOnly) {
     if (res.runStderr) {

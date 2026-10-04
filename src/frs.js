@@ -12,12 +12,17 @@
 
   var VERSION = '0.1.0';
 
-  // opts: {file, lib, noColor, run:true/false, warnings:true/false}
+  // opts: {file, lib, noColor, run:true/false, warnings:true/false, onProgress(pct,label)}
+  function emitProgress(opts, pct, label) {
+    if (opts && typeof opts.onProgress === 'function') { try { opts.onProgress(pct, label); } catch (e) {} }
+  }
   function compile(src, opts) {
     opts = opts || {};
     var file = opts.file || 'main.rs';
     var t0 = now();
+    emitProgress(opts, 0, 'lexing');
     var rep = CHECKER.check(src, file, { lib: !!opts.lib });
+    emitProgress(opts, 60, 'checked');
     var diags = rep.diags;
     if (opts.warnings === false) diags = diags.filter(function (d) { return d.level !== 'warning'; });
     var stderr = '';
@@ -30,6 +35,7 @@
     var stdout = '', runRes = null, panicText = '';
     var success = rep.errCount === 0;
     if (success && opts.run !== false) {
+      emitProgress(opts, 80, 'running');
       runRes = INTERP.run(src, {});
       stdout = runRes.stdout || '';
       if (runRes.stderr) panicText = runRes.stderr;
@@ -43,6 +49,7 @@
       }
     }
     if (runRes && runRes.serve) { try { if (typeof global !== 'undefined') global.__frsServerRunning = true; } catch (e) {} }
+    emitProgress(opts, 100, 'done');
     return {
       success: success && !runResPanicked(runRes),
       compileOk: rep.errCount === 0,
@@ -74,5 +81,31 @@
     return Date.now();
   }
 
-  return { compile: compile, check: check, VERSION: VERSION };
+  // Parallel multi-file compile (pure JS, zero deps): all files are
+  // checked/run concurrently via Promise.all + setImmediate slicing, so large
+  // workspaces compile extremely fast. Progress: `onProgress(pct, label)`.
+  function compileParallel(sources, opts) {
+    opts = opts || {};
+    var names = Object.keys(sources);
+    var total = names.length || 1;
+    var done = 0;
+    function one(name) {
+      return new Promise(function (resolve) {
+        var runAsync = typeof setImmediate !== 'undefined' ? setImmediate : function (fn) { setTimeout(fn, 0); };
+        runAsync(function () {
+          var r = compile(sources[name], { file: name, lib: opts.lib, run: opts.run, warnings: opts.warnings });
+          done++;
+          emitProgress(opts, Math.round((done / total) * 100), name);
+          resolve({ name: name, result: r });
+        });
+      });
+    }
+    return Promise.all(names.map(one)).then(function (arr) {
+      var out = {};
+      for (var i = 0; i < arr.length; i++) out[arr[i].name] = arr[i].result;
+      return out;
+    });
+  }
+
+  return { compile: compile, check: check, compileParallel: compileParallel, VERSION: VERSION };
 }));

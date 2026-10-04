@@ -135,6 +135,12 @@
   }
 
   // resolve -> download -> extract -> compile dep -> cache artifact
+  // Parallel (pure Node.js, zero deps): all deps resolve/download concurrently
+  // via Promise.all, then compile concurrently with simple % progress.
+  function reportPct(done, total, label) {
+    var pct = total ? Math.round((done / total) * 100) : 100;
+    try { process.stderr.write('Compiling ' + pct + '% done' + (label ? ' (' + label + ')' : '') + '\n'); } catch (e) {}
+  }
   async function ensureDeps(root) {
     var cfg = parseCargoToml(fs.readFileSync(path.join(root, 'Cargo.toml'), 'utf8'));
     var deps = {};
@@ -143,33 +149,33 @@
 
     var cacheDir = path.join(root, 'frs_target', 'registry');
     os_mkdir(cacheDir);
-    for (var i = 0; i < names.length; i++) {
-      var name = names[i];
+    reportPct(0, names.length, 'resolving');
+    // Phase 1 (parallel): resolve version + download + extract per dep.
+    var resolved = await Promise.all(names.map(async function (name) {
       var spec = cfg.dependencies[name];
-      var ver = null;
-
-      // exact match first: already cached?
-      var cand = pickLocalVersion(cacheDir, name, spec.version);
-      if (cand) {
-        ver = cand;
-      } else {
-        process.stdout.write('    Updating crates.io index\n');
-        var vers;
-        try { vers = await fetchVersionsWithUA(name); }
-        catch (e) { err('error: could not reach crates.io for `' + name + '`: ' + e.message); throw e; }
-        ver = bestVersion(vers, spec.version);
-        if (!ver) { err('error: no version of `' + name + '` matches `' + spec.version + '`'); throw new Error('bad version'); }
-        process.stdout.write('  Downloading ' + name + ' v' + ver + '\n');
-        try {
-          await downloadCrate(name, ver, dlPath(cacheDir, name, ver));
-          var srcDir = path.join(cacheDir, 'src', name + '-' + ver);
-          os_mkdir(path.join(cacheDir, 'src'));
-          cp.execSync('tar -xzf "' + dlPath(cacheDir, name, ver) + '" -C "' + path.join(cacheDir, 'src') + '"');
-        } catch (e) { err('error: ' + e.message); throw e; }
-      }
-      deps[name] = ver;
-      compileDepCached(root, name, ver, cacheDir);
-    }
+      var ver = pickLocalVersion(cacheDir, name, spec.version);
+      if (ver) return { name: name, ver: ver, cached: true };
+      process.stdout.write('    Updating crates.io index\n');
+      var vers = await fetchVersionsWithUA(name).catch(function (e) {
+        err('error: could not reach crates.io for `' + name + '`: ' + e.message); throw e;
+      });
+      ver = bestVersion(vers, spec.version);
+      if (!ver) { err('error: no version of `' + name + '` matches `' + spec.version + '`'); throw new Error('bad version'); }
+      process.stdout.write('  Downloading ' + name + ' v' + ver + '\n');
+      await downloadCrate(name, ver, dlPath(cacheDir, name, ver));
+      var srcDir = path.join(cacheDir, 'src', name + '-' + ver);
+      os_mkdir(path.join(cacheDir, 'src'));
+      cp.execSync('tar -xzf "' + dlPath(cacheDir, name, ver) + '" -C "' + path.join(cacheDir, 'src') + '"');
+      return { name: name, ver: ver, cached: false };
+    }));
+    // Phase 2 (parallel): compile dep crates concurrently (each is independent).
+    var done = 0;
+    await Promise.all(resolved.map(async function (r) {
+      compileDepCached(root, r.name, r.ver, cacheDir);
+      done++;
+      reportPct(done, resolved.length, r.name + ' v' + r.ver);
+    }));
+    for (var k = 0; k < resolved.length; k++) deps[resolved[k].name] = resolved[k].ver;
     return { cfg: cfg, installed: deps };
   }
 
@@ -280,7 +286,9 @@
     if (!fs.existsSync(mainFile)) mainFile = path.join(root, 'main.rs');
     var src = fs.readFileSync(mainFile, 'utf8');
     var F = getFRS();
+    reportPct(50, 100, 'checking');
     var res = F.compile(src, { file: 'main.rs', lib: false, run: false });
+    reportPct(100, 100, 'done');
     if (!res.compileOk) { process.stderr.write(res.stderr); return 1; }
     if (res.stderr) process.stderr.write(res.stderr);
     say('    Finished `dev` profile');
@@ -296,12 +304,19 @@
     if (!fs.existsSync(mainFile)) mainFile = path.join(root, 'main.rs');
     var src = fs.readFileSync(mainFile, 'utf8');
     var F = getFRS();
+    reportPct(50, 100, 'checking');
     var res = F.compile(src, { file: 'main.rs' });
+    reportPct(100, 100, 'done');
     if (!res.compileOk) { process.stderr.write(res.stderr); return 1; }
     if (res.stderr) process.stderr.write(res.stderr);
     say('     Running `' + (depsInfo.cfg.package.name || 'target') + '`');
     if (res.runStderr) { process.stderr.write(res.runStderr + '\n'); return 101; }
     process.stdout.write(res.stdout || '');
+    if (res.serve) {
+      // continuous web server (pure Node.js net): do NOT exit — keep serving hits.
+      try { if (typeof global !== 'undefined') global.__frsServerRunning = true; } catch (eG) {}
+      return new Promise(function () {}); // never resolves, event loop keeps server alive
+    }
     return 0;
   }
 
