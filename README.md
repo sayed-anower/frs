@@ -3,27 +3,47 @@ frs is an execution and analysis environment written entirely in JavaScript. Rat
  * **Zero Dependencies & Pure JS** — Runs seamlessly in Node.js environments and browser contexts (index.html).
  * **High Performance** — Designed with O(n) single-pass lexing and validation, linear token processing with integer enums, precomputed line mappings, and zero-allocation execution paths.
  * **rustc-Compatible Diagnostics** — Renders identical output structures (error[E0308]: …, --> main.rs:2:5, caret spans, help:/note: annotations, abort footers, panics, and TTY color output).
- * **Declarative Rule Engine** — All diagnostic validation logic resides in src/rules.js. Adding new checks requires defining a single configuration object.
+ * **Declarative Rule Engine** — All diagnostic validation logic resides in src/rules/ (one focused file per rule family). Adding new checks requires defining a single configuration object.
  * **Cargo-Compatible Workflow** — Supports frs new, build, run, and check, featuring native Cargo.toml parsing along with dependency resolution, extraction, compilation, and artifact caching from crates.io.
  * **Native Side Effects (Node.js)** — Supports system-level I/O operations including File::create/open, read_to_string, writeln!, standard input reading, TcpListener::bind network server sockets, and binary buffer management via byte strings and slices (b"...", &[u8]).
 ## Directory Structure
 ```
 frs/
   src/
-    util.js         Character utilities, line mapping, and formatting options
-    lexer.js        Single-pass lexical analyzer supporting byte strings and literals
-    diagnostics.js  Rustc-compliant diagnostic output generator
-    rules.js        Declarative validation rule configurations
-    checker.js      Single-pass syntax and type validation engine
-    interpreter.js  Runtime execution engine (I/O, formatting, control flow, traits)
-    frs.js          Core compilation pipeline API: compile(src, opts)
-    pm.js           Package management module for project setup and dependency management
-  bin/frs(.js)      CLI interface supporting standard flags and subcommands
-  examples/         Sample applications ranging from basic scripts to socket servers
-  tests/run.js      Zero-dependency test suite runner (`npm test`)
-  index.html        Browser-based interactive demo interface
+    util.js              Character utilities, line mapping, and formatting options
+    lexer.js             Single-pass lexical analyzer supporting byte strings and literals
+    diagnostics.js       Rustc-compliant diagnostic output generator
+    rules.js             Back-compat shim — re-exports src/rules/index.js
+    rules/
+      known.js           Shared vocabularies: KNOWN_TYPES / KNOWN_MACROS / KNOWN_FNS
+      syntax_rules.js    R* rule table + check implementations (delimiters, blocks, …)
+      type_rules.js      T* rule table + check implementations (types, calls, …)
+      borrow_rules.js    B* rule table + NLL borrow model (moves, borrows, lifetimes)
+      warn_rules.js      W* rule table + check implementations (unused code, …)
+      int_rules.js       Interpreter lookup tables (HTTP statuses, route methods)
+      index.js           Merges every rule module: { RULES, KNOWN_*, attachAll }
+    checker.js           Core engine: single token scan + RULES dispatch + inference
+    interpreter.js       Core engine: runtime execution (I/O, formatting, control flow, traits)
+    frs.js               Core compilation pipeline API: compile(src, opts)
+    pm.js                Package management module for project setup and dependency management
+  bin/frs(.js)           CLI interface supporting standard flags and subcommands
+  examples/              Sample applications: hello, error_demo, advanced,
+                         highly_advance, extreme_advance, web_server, borrow_checker
+  tests/run.js           Zero-dependency test suite runner (`npm test`)
+  index.html             Browser-based interactive demo interface
 
 ```
+**What each file does:**
+| File | Role — why it exists |
+|---|---|
+| `src/lexer.js` | Tokenizer only. Turns source text into `{ t, v, idx, line, col, pos }` tokens. No checks, no execution. |
+| `src/checker.js` | Core analysis engine. One token pass collects scope (`lets/assigns/calls/identUses/…`), then runs every matching `RULES` entry and sorts diagnostics. Knows *how to scan*, never *what is an error*. |
+| `src/interpreter.js` | Core execution engine. Evaluates token slices (`execBlock`/`evalExpr`), owns variables, `&mut` aliasing, and all real Node side effects (`fs`/`net`/`http`). Knows *how to run*, never *what is an error*. |
+| `src/rules/*.js` | The actual checks, one family per file. To add/forbid/relax a diagnostic, edit exactly one of these — engines stay untouched. |
+| `src/rules/index.js` | Glue: concatenates the four rule tables and chains the four `attach*` installers. The only file `checker.js` imports for rules. |
+| `src/diagnostics.js` | Renderer only: diagnostics → rustc-shaped text (spans, `help:`/`note:`, footers, colors). |
+| `src/frs.js` | Facade: `compile(src, opts)` = check → render → run. Used by the CLI, `pm.js`, tests, and browsers. |
+| `src/pm.js` | Cargo workflow (`new/build/run/check`): `Cargo.toml` parsing, crates.io download/extract, transitive resolution, per-file dep checking + artifact cache. |
 ## Quick Start
 ```sh
 node bin/frs.js examples/hello.rs
@@ -46,6 +66,13 @@ console.log(result.success, result.timeMs + 'ms');
 <script src="src/util.js"></script>
 <script src="src/lexer.js"></script>
 <script src="src/diagnostics.js"></script>
+<script src="src/rules/known.js"></script>
+<script src="src/rules/syntax_rules.js"></script>
+<script src="src/rules/type_rules.js"></script>
+<script src="src/rules/borrow_rules.js"></script>
+<script src="src/rules/warn_rules.js"></script>
+<script src="src/rules/int_rules.js"></script>
+<script src="src/rules/index.js"></script>
 <script src="src/rules.js"></script>
 <script src="src/checker.js"></script>
 <script src="src/interpreter.js"></script>
@@ -105,8 +132,17 @@ Dependencies declared in [dependencies] within Cargo.toml are fetched from [http
 | T013 | — | Mismatch between macro placeholders and supplied arguments |
 | T015/T016 | — | Invalid placement of break/continue or return statements |
 | T017 | E0255 | Duplicate function definition within scope |
+| T018 | E0433 | `use` of a crate that is not a dependency (project mode only) |
+| B001 | E0382 | Use of a moved value (`let y = x`, by-value args, `drop(x)`) |
+| B002 | E0499 | Two live `&mut` borrows of the same value |
+| B003 | E0502 | Use/mutation while incompatibly borrowed (both directions) |
+| B004 | E0505 | Move out of a value while it is borrowed |
+| B005 | E0596 | `&mut x` where `x` is not declared `mut` |
+| B006 | E0515 | Returning a reference to a function-local value |
 | W001/W002/W003 | — | Unused variable, unused function, or unmutated mut binding warnings |
 Type inference evaluates standard primitives (5 \to int-lit, "..." \to &str, b"..." \to &[u8], '...' \to char, true \to bool), macro initializations (vec![...] \to Vec<_>, format!/to_string/String::from \to String), and single-level variable bindings. Ambiguous type expressions are safely bypassed to prevent false-positive diagnostic reports.
+### Ownership & Borrows (B-rules, src/rules/borrow_rules.js)
+Non-Lexical-Lifetime model over the same single pass: moves are `let y = x` / `y = x` / by-value call arguments / `drop(x)` on non-`Copy` values (`String`, `Vec`, collections, user structs/enums — primitives, `&` refs and unknowns are `Copy` and never move). `.clone()`/`.to_owned()`/borrowing never moves. A borrow is live from `&x`/`&mut x` creation to the last use of its reference, so released borrows don't block later code; `let`-shadowing or `x = ...` re-initialization ends a moved state. Unknown shapes (field borrows `&s.f`, `match` ergonomics, `for x in vec`) pass leniently instead of risking false positives. Try it: `node bin/frs.js examples/borrow_checker.rs`.
 ### Supported Language Syntax
  * **Structures:** Declarations for struct, enum (including discriminants and fieldless variants), impl and trait blocks, type aliases, const/static declarations, mod structures, macro_rules! blocks, and outer/inner attribute annotations (#[..], #![..]).
  * **Statements & Expressions:** Variable patterns (let (a, b) = ...), pattern matching constructs (if let, while let, destructuring match arms), struct initialization patterns (Self { .. }), closures (|x|), keyword syntax (async/await), raw strings (r#"..."#), byte strings (b"..."), nested import trees, generic type signatures (including where clauses and lifetime parameters), and unsafe blocks.
@@ -114,6 +150,7 @@ Type inference evaluates standard primitives (5 \to int-lit, "..." \to &str, b".
  * **Standard I/O Formatting:** println!, print!, eprintln!, and eprint! with support for display {} and debug {:?} specifications, alignment parameters {:.2}, positional indexes {0}, named references {x}, and variable capture syntax.
  * **Built-in Macros:** Support for format!, vec![...], vec![x; n], user-defined macro_rules! (evaluating $name:expr bindings and pattern matching variants), panic!, assertion macros (assert!, assert_eq!, assert_ne!), todo!, and unreachable!.
  * **Data Types & Structures:** Structs, enums, tuple variants, Option and Result constructors, dynamic Vec structures, fixed-size arrays ([0; 1024]), numeric ranges, indexing operations (v[i]), and slices (v[..n], v[a..b], v[a..=b]).
+ * **References & Ownership:** Shared (`&x`) and exclusive (`&mut x`) borrows evaluate transparently; `*r` reads stay fresh and `*r = v` / `*r += v` write through to the borrowed binding — including `&mut` parameters writing back to the caller's variable. Moves and `.clone()` behave by value.
  * **Control Flow Logic:** Standard branching (if/else), match expression evaluation, iteration construct loops (for, loop, while), control interruptions (break, continue, return), and recursion depth validation.
  * **Traits & Implementations:** Associated functions (Type::new), method dispatch (Type::method), static trait implementations, structural bindings (Self), and indirect Display execution using Type::fmt.
  * **Error Propagation:** Early return handling with the ? operator on Result and Option primitives.
@@ -122,11 +159,11 @@ Type inference evaluates standard primitives (5 \to int-lit, "..." \to &str, b".
  * **Native Networking Sockets:** Server creation via TcpListener::bind("127.0.0.1:PORT"), connection polling with for stream in listener.incoming(), and read/write stream handling on connected client sockets.
  * **Binary Data Operations:** Direct byte literal evaluations (b"..."), unsigned 8-bit array handling, as_bytes() conversions, slice referencing, and UTF-8 string conversions via String::from_utf8_lossy.
 ## Adding Custom Validation Rules
-Rules are declared as structured configuration objects in **src/rules.js**. Static analysis queries are dispatched through the unified context object (ctx) inside src/checker.js.
-### 1. Register Rule Entry (src/rules.js)
+Rules are declared as structured configuration objects in **src/rules/*_rules.js** (pick the family file: `syntax_rules.js`, `type_rules.js`, `borrow_rules.js`, `warn_rules.js`). Static analysis queries are dispatched through the unified context object (ctx) inside src/checker.js. `src/rules/index.js` picks the new entry up automatically — no other file to touch.
+### 1. Register Rule Entry (src/rules/<family>_rules.js)
 ```js
 {
-  id: 'T020',            // Prefix designation: R* (syntax), T* (type), W* (warning)
+  id: 'T020',            // Prefix designation: R* (syntax), T* (type), B* (borrow), W* (warning)
   code: 'E0599',         // Corresponding rustc E-code identifier or null
   level: 'error',        // Severity classification: 'error' | 'warning'
   anchor: 'call',        // Execution scope anchor point
@@ -146,7 +183,7 @@ Rules are declared as structured configuration objects in **src/rules.js**. Stat
 | call | Invocation node ({name, argCount, isMethod}) | Parameter signature and target check verification |
 | macro | Macro invocation node ({name, fmtStr, argCount}) | Format argument matching and string validation |
 | keyword | Keyword statement node (break, continue, return) | Execution context scope verification |
-### 2. Implement Rule Logic (src/checker.js)
+### 2. Implement Rule Logic (same family file, inside its `attach*` function)
 ```js
 ctx.checkNoFoo = function () {
   var node = ctx.current;
@@ -202,7 +239,7 @@ npm test
 ## Operational Constraints
 frs is an execution engine focused on rapid validation and portable execution rather than full compiler parity:
  * Type inference uses shallow evaluations; complex expressions evaluate to unknown without throwing false positives.
- * Borrow checking and lifetime validations are omitted.
+ * Borrow checking covers moves, `&`/`&mut` liveness (NLL), and returned locals; lifetime annotations pass through unchecked, and exotic shapes (disjoint field borrows, match ergonomics, `for x in vec` moves) are lenient rather than noisy.
  * Trait dispatch is namespaced via static bindings (Type::method) without dynamic vtable dispatch.
  * Closures evaluate in local contexts, and asynchronous execution workflows pass without native runtime yield scheduling.
  * Reaching defined execution step limits generates standard execution panics (thread 'main' panicked at 'frs: execution limit exceeded').

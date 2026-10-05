@@ -63,6 +63,25 @@ t('macro_rules interp', 'macro_rules! m { ($x:expr) => { $x + 1 }; } fn main() {
 t('if let no false else-err', 'fn main() { let x = Some(1); if let Some(v) = x { println!("{}", v); } else { println!("n"); } }', { ok: true, stdout: '1\n' });
 t('parse.rs syntax', 'fn f<S: Into<String>>(s: S) -> String { S::from(s) } fn main() {}', { ok: true });
 
+// ---- ownership & borrows (B001-B006) ----
+t('B001 use after move', 'fn main() { let s = String::from("x"); let t = s; println!("{}", s); }', { ok: false, errContains: 'moved value' });
+t('B001 move into call', 'fn take(s: String) -> usize { s.len() } fn main() { let s = String::from("x"); take(s); println!("{}", s); }', { ok: false, errContains: 'moved value' });
+t('B001 clone keeps both', 'fn main() { let s = String::from("x"); let t = s.clone(); println!("{}{}", s, t); }', { ok: true, stdout: 'xx\n' });
+t('B001 reinit heals move', 'fn main() { let mut s = String::from("a"); let t = s; s = String::from("b"); println!("{}{}", s, t); }', { ok: true, stdout: 'ba\n' });
+t('B002 double &mut', 'fn main() { let mut x = 5; let a = &mut x; let b = &mut x; println!("{}{}", a, b); }', { ok: false, errContains: 'more than once' });
+t('B002 sequential &mut ok', 'fn main() { let mut x = 5; let a = &mut x; println!("{}", a); let b = &mut x; println!("{}", b); }', { ok: true, stdout: '5\n5\n' });
+t('B003 use while mutably borrowed', 'fn main() { let mut x = 5; let m = &mut x; println!("{}", x); println!("{}", m); }', { ok: false, errContains: 'mutably borrowed' });
+t('B003 &mut while shared', 'fn main() { let mut v = String::from("v"); let r = &v; let m = &mut v; println!("{}{}", r, m); }', { ok: false, errContains: 'also borrowed as immutable' });
+t('B003 & while mutably borrowed', 'fn main() { let mut x = 5; let m = &mut x; let r = &x; println!("{}{}", m, r); }', { ok: false, errContains: 'also borrowed as mutable' });
+t('B003 NLL release ok', 'fn main() { let mut w = String::from("a"); let m = &mut w; println!("{}", m); println!("{}", w); }', { ok: true, stdout: 'a\na\n' });
+t('B004 move while borrowed', 'fn main() { let s = String::from("x"); let r = &s; let t = s; println!("{}{}", r, t); }', { ok: false, errContains: 'because it is borrowed' });
+t('B005 &mut of immutable', 'fn main() { let x = 5; let r = &mut x; println!("{}", r); }', { ok: false, errContains: 'not declared as mutable' });
+t('B005 &mut call arg of immutable', 'fn f(s: &mut String) {} fn main() { let h = String::from("h"); f(&mut h); }', { ok: false, errContains: 'not declared as mutable' });
+t('B006 return local ref', 'fn f() -> &i32 { let x = 1; &x } fn main() {}', { ok: false, errContains: 'local variable' });
+t('B006 return owned ok', 'fn f() -> String { String::from("x") } fn main() { println!("{}", f()); }', { ok: true, stdout: 'x\n' });
+t('deref write runs', 'fn main() { let mut x = 5; let r = &mut x; *r += 1; println!("{}", x); }', { ok: true, stdout: '6\n' });
+t('&mut param writes back', 'fn bump(n: &mut i32) { *n += 10; } fn main() { let mut x = 1; bump(&mut x); println!("{}", x); }', { ok: true, stdout: '11\n' });
+
 console.log('\n' + passed + ' passed, ' + failed + ' failed');
 
 // ---- browser compat: load every src/*.js in a `module`-less vm sandbox ----
@@ -73,7 +92,10 @@ console.log('\n' + passed + ' passed, ' + failed + ' failed');
     var sandbox = {};
     sandbox.self = sandbox;
     vm.createContext(sandbox);
-    ['util.js', 'lexer.js', 'diagnostics.js', 'rules.js', 'checker.js', 'interpreter.js', 'frs.js']
+    ['util.js', 'lexer.js', 'diagnostics.js',
+     'rules/known.js', 'rules/syntax_rules.js', 'rules/type_rules.js',
+     'rules/borrow_rules.js', 'rules/warn_rules.js', 'rules/int_rules.js',
+     'rules/index.js', 'rules.js', 'checker.js', 'interpreter.js', 'frs.js']
       .forEach(function (f) {
         vm.runInContext(fs.readFileSync(path.join(__dirname, '..', 'src', f), 'utf8'), sandbox, { filename: f });
       });

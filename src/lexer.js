@@ -106,12 +106,24 @@
         // else fall through as ident
       }
 
-      // string "..."
+      // string "..." (supports `\` + newline continuation like Rust:
+      // the newline and all leading whitespace on the next line are skipped)
       if (ch === 34) {
         var s0 = i, l0 = line, c00 = col, esc = false, term = false;
         i++; col++;
         while (i < n) {
           var d = src.charCodeAt(i);
+          if (esc && (d === 10 || d === 13)) {
+            // string continuation: skip newline + leading whitespace
+            esc = false;
+            while (i < n) {
+              var w = src.charCodeAt(i);
+              if (w === 10) { line++; col = 1; i++; }
+              else if (w === 13 || w === 32 || w === 9) { if (w === 13) { line++; col = 1; } else col++; i++; }
+              else break;
+            }
+            continue;
+          }
           if (d === 10) break; // Rust strings can't span raw newline (must use \); report unterminated
           if (esc) { esc = false; i++; col++; continue; }
           if (d === 92) { esc = true; i++; col++; continue; }
@@ -252,6 +264,17 @@
           i++; col++;
           while (i < n) {
             var bd = src.charCodeAt(i);
+            if (bsEsc && (bd === 10 || bd === 13)) {
+              // byte-string continuation: same rule as strings
+              bsEsc = false;
+              while (i < n) {
+                var bw = src.charCodeAt(i);
+                if (bw === 10) { line++; col = 1; i++; }
+                else if (bw === 13 || bw === 32 || bw === 9) { if (bw === 13) { line++; col = 1; } else col++; i++; }
+                else break;
+              }
+              continue;
+            }
             if (bd === 10) break;
             if (bsEsc) { bsEsc = false; i++; col++; continue; }
             if (bd === 92) { bsEsc = true; i++; col++; continue; }

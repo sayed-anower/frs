@@ -12,7 +12,9 @@
 
   var VERSION = '0.1.0';
 
-  // opts: {file, lib, noColor, run:true/false, warnings:true/false, onProgress(pct,label)}
+  // opts: {file, lib, noColor, run:true/false, warnings:true/false, onProgress(pct,label),
+  //          externs:[crate names] (project mode `use`-root check), localMods:[mod names],
+  //          noListen (build route table, don't bind)}
   function emitProgress(opts, pct, label) {
     if (opts && typeof opts.onProgress === 'function') { try { opts.onProgress(pct, label); } catch (e) {} }
   }
@@ -21,7 +23,7 @@
     var file = opts.file || 'main.rs';
     var t0 = now();
     emitProgress(opts, 0, 'lexing');
-    var rep = CHECKER.check(src, file, { lib: !!opts.lib });
+    var rep = CHECKER.check(src, file, { lib: !!opts.lib, externs: opts.externs || null, localMods: opts.localMods || null });
     emitProgress(opts, 60, 'checked');
     var diags = rep.diags;
     if (opts.warnings === false) diags = diags.filter(function (d) { return d.level !== 'warning'; });
@@ -36,7 +38,7 @@
     var success = rep.errCount === 0;
     if (success && opts.run !== false) {
       emitProgress(opts, 80, 'running');
-      runRes = INTERP.run(src, {});
+      runRes = INTERP.run(src, { noListen: !!opts.noListen });
       stdout = runRes.stdout || '';
       if (runRes.stderr) panicText = runRes.stderr;
       if (runRes.panicked && !runRes.panicked.limit) {
@@ -93,7 +95,7 @@
       return new Promise(function (resolve) {
         var runAsync = typeof setImmediate !== 'undefined' ? setImmediate : function (fn) { setTimeout(fn, 0); };
         runAsync(function () {
-          var r = compile(sources[name], { file: name, lib: opts.lib, run: opts.run, warnings: opts.warnings });
+          var r = compile(sources[name], { file: name, lib: opts.lib, run: opts.run, warnings: opts.warnings, externs: opts.externs || null, localMods: opts.localMods || null, noListen: opts.noListen });
           done++;
           emitProgress(opts, Math.round((done / total) * 100), name);
           resolve({ name: name, result: r });

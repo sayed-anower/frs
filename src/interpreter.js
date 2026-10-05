@@ -3,15 +3,18 @@
  */
 (function (root, factory) {
   if (typeof module !== 'undefined' && module.exports) {
-    var req = function (p) { try { return require(p); } catch (e) { return root['FRS_' + p.slice(2, -3)]; } };
-    module.exports = factory(req('./util.js'), req('./lexer.js'));
-  } else root.FRS_interp = factory(root.FRS_util, root.FRS_lexer);
-}(typeof self !== 'undefined' ? self : this, function (U, LEX) {
+    var req = function (p) { try { return require(p); } catch (e) { return null; } };
+    module.exports = factory(req('./util.js'), req('./lexer.js'), req('./rules/int_rules.js'));
+  } else root.FRS_interp = factory(root.FRS_util, root.FRS_lexer, root.FRS_rules_int);
+}(typeof self !== 'undefined' ? self : this, function (U, LEX, INT_RULES) {
   'use strict';
+  INT_RULES = INT_RULES || {};
   var FS_X = null;
   try { FS_X = (typeof require !== 'undefined') ? require('fs') : null; } catch (e) { FS_X = null; }
   var NET_X = null;
   try { NET_X = (typeof require !== 'undefined') ? require('net') : null; } catch (e) { NET_X = null; }
+  var HTTP_X = null;
+  try { HTTP_X = (typeof require !== 'undefined') ? require('http') : null; } catch (e) { HTTP_X = null; }
   var TCP_SRVS = [];
   var NET_LISTENING = false;
   U = U || {}; LEX = LEX || {};
@@ -20,6 +23,22 @@
   var MAX_STEPS = 200000;
   var MAX_LOOP = 10000;
   var MAX_OUT = 20000;
+  // Runtime lookup tables (src/rules/int_rules.js; inline fallback keeps the
+  // engine working when the tables file isn't loaded, e.g. minimal embeds).
+  var HTTP_STATUS = INT_RULES.HTTP_STATUS || {
+    Ok: 200, Created: 201, Accepted: 202, NoContent: 204,
+    MovedPermanently: 301, Found: 302, SeeOther: 303, NotModified: 304,
+    TemporaryRedirect: 307, PermanentRedirect: 308,
+    BadRequest: 400, Unauthorized: 401, PaymentRequired: 402, Forbidden: 403,
+    NotFound: 404, MethodNotAllowed: 405, Conflict: 409, Gone: 410,
+    UnprocessableEntity: 422, InternalServerError: 500, NotImplemented: 501,
+    BadGateway: 502, ServiceUnavailable: 503, GatewayTimeout: 504
+  };
+  // route-attr macros: #[get("/")] / #[post(..)] / #[route(..)] / ...
+  var HTTP_ROUTE_METHODS = INT_RULES.HTTP_ROUTE_METHODS || {
+    get: 'GET', post: 'POST', put: 'PUT', delete: 'DELETE', head: 'HEAD',
+    options: 'OPTIONS', patch: 'PATCH', trace: 'TRACE', connect: 'CONNECT'
+  };
   var openFds = [];
   var STDIN_STATE = null;
   function readStdinLine() {
@@ -39,6 +58,9 @@
   }
   function run(src, opts) {
     opts = opts || {};
+    // serving state is per-run: a previous server run in this process must not
+    // leak `serve:true` into later runs (tests run many compiles in one process).
+    NET_LISTENING = false;
     var lexed;
     try { lexed = LEX.lex(src); } catch (e) { lexed = { tokens: [] }; }
     var toks = lexed.tokens || [];
@@ -98,7 +120,10 @@
 
     // Execute fn main body (or whole file if no fn? run top-level lets+prints)
     var main = fns.main;
-    var state = { steps: 0, qns: qns, macros: macros };
+    var state = { steps: 0, qns: qns, macros: macros, opts: opts };
+    // actix-web style route table (`#[get("/")]` + factory `.service/.route`)
+    // collected up-front so `HttpServer::run()` can dispatch per request.
+    state.routes = collectRoutes(toks, fns);
     try {
       if (main) execBlock(main.bodyToks, env, fns, stdout, stderr, state);
       else execBlock(toks, env, fns, stdout, stderr, state);
@@ -119,6 +144,295 @@
       env: env,
       serve: serving
     };
+  }
+
+  // ---- actix-web style routing + serving (pure Node.js http, zero deps) ----
+  // Routes come from `#[get("/path")]`-style attributes on handler fns plus
+  // `.route("path", web::get().to(handler))` registrations in the factory.
+  function matchTokIn(arr, from, open, close) {
+    var d = 0;
+    for (var i = from; i < arr.length; i++) {
+      if (arr[i].v === open) d++;
+      else if (arr[i].v === close) { d--; if (d === 0) return i; }
+    }
+    return -1;
+  }
+  function routeArgString(argToks) {
+    if (!argToks || argToks.length !== 1) return null;
+    var t = argToks[0];
+    if (t.t === T.STRING) {
+      var inner = t.v.slice(1, -1);
+      return inner.replace(/\\n/g, '\n').replace(/\\t/g, '\t').replace(/\\r/g, '\r').replace(/\\"/g, '"').replace(/\\\\/g, '\\');
+    }
+    if (t.t === T.RAWSTR) {
+      var q = t.v.indexOf('"'), h = 0, k;
+      for (k = 1; k < q; k++) if (t.v[k] === '#') h++;
+      return t.v.slice(q + 1, t.v.length - 1 - h);
+    }
+    return null;
+  }
+  function parseRouteAttr(inner, fname, routes) {
+    // macro name = last IDENT before `(` (handles `actix_web::get("/..")` too)
+    var mname = null, paren = -1;
+    for (var a = 0; a < inner.length; a++) {
+      if (inner[a].t === T.IDENT && inner[a + 1] && inner[a + 1].v === '(') { mname = inner[a].v; paren = a + 1; break; }
+    }
+    if (!mname || paren === -1) return;
+    var close = matchTokIn(inner, paren, '(', ')');
+    var args = splitArgs(inner.slice(paren + 1, close === -1 ? inner.length : close)).filter(function (x) { return x.length; });
+    if (HTTP_ROUTE_METHODS[mname]) {
+      var p = args.length ? routeArgString(args[0]) : null;
+      if (p !== null) routes.push({ method: HTTP_ROUTE_METHODS[mname], path: p, handler: fname });
+      return;
+    }
+    if (mname === 'route') {
+      var rp = args.length ? routeArgString(args[0]) : null;
+      if (rp === null) rp = '/';
+      var methods = [];
+      for (var q = 0; q < args.length; q++) {
+        var aa = args[q];
+        for (var w = 0; w + 2 < aa.length; w++) {
+          if (aa[w].t === T.IDENT && aa[w].v === 'method' && aa[w + 1].v === '=') {
+            var mv = routeArgString([aa[w + 2]]);
+            if (mv) methods.push(mv.toUpperCase());
+          }
+        }
+      }
+      if (!methods.length) methods.push('*');
+      for (var m2 = 0; m2 < methods.length; m2++) routes.push({ method: methods[m2], path: rp, handler: fname });
+    }
+  }
+  function scanFactoryRoutes(toks, fns, routes) {
+    // `.route("path", web::get().to(handler))` inside the HttpServer factory
+    for (var i = 0; i + 3 < toks.length; i++) {
+      if (toks[i].t !== T.IDENT || toks[i].v !== 'route') continue;
+      if (!toks[i + 1] || toks[i + 1].v !== '(') continue;
+      var ce = matchTok(toks, i + 1, '(', ')');
+      if (ce === -1 || ce - i > 80) continue;
+      var args = splitArgs(toks.slice(i + 2, ce)).filter(function (x) { return x.length; });
+      if (args.length < 2) continue;
+      var rp = routeArgString(args[0]);
+      if (rp === null) continue;
+      var meth = null, handler = null;
+      var rest = args[1];
+      for (var r2 = 0; r2 < rest.length; r2++) {
+        if (rest[r2].t === T.IDENT && HTTP_ROUTE_METHODS[rest[r2].v] && rest[r2 + 1] && rest[r2 + 1].v === '(') {
+          if (!meth) meth = HTTP_ROUTE_METHODS[rest[r2].v];
+        }
+        if (rest[r2].t === T.IDENT && rest[r2].v === 'to' && rest[r2 + 1] && rest[r2 + 1].v === '(' &&
+            rest[r2 + 2] && rest[r2 + 2].t === T.IDENT && rest[r2 + 3] && rest[r2 + 3].v === ')') {
+          handler = rest[r2 + 2].v;
+        }
+      }
+      if (handler && fns[handler]) routes.push({ method: meth || '*', path: rp, handler: handler });
+    }
+  }
+  function collectRoutes(toks, fns) {
+    var routes = [];
+    for (var i = 0; i + 1 < toks.length; i++) {
+      if (toks[i].t === T.IDENT && toks[i].v === 'fn' && toks[i + 1] && toks[i + 1].t === T.IDENT) {
+        var fname = toks[i + 1].v;
+        if (!fns[fname]) continue;
+        // scan back over `#[...]` attribute groups directly above the fn,
+        // skipping modifiers (`async fn`, `pub fn`, `pub(crate) fn`, ...)
+        var j = skipFnModifiers(toks, i - 1), guards = 0;
+        while (j >= 0 && toks[j].v === ']' && guards < 8) {
+          guards++;
+          var o = j, d = 0;
+          while (o >= 0) {
+            if (toks[o].v === ']') d++;
+            else if (toks[o].v === '[') { d--; if (d === 0) break; }
+            o--;
+          }
+          if (o < 1 || !toks[o - 1] || toks[o - 1].v !== '#') break;
+          parseRouteAttr(toks.slice(o + 1, j), fname, routes);
+          j = skipFnModifiers(toks, o - 2);
+        }
+      }
+    }
+    try { scanFactoryRoutes(toks, fns, routes); } catch (eF) {}
+    return routes;
+  }
+  function skipFnModifiers(toks, j) {
+    while (j >= 0 && toks[j]) {
+      var mv = toks[j].v;
+      if (toks[j].t === T.IDENT && (mv === 'async' || mv === 'pub' || mv === 'unsafe' || mv === 'const' || mv === 'extern')) { j--; continue; }
+      if (mv === ')') {
+        var o2 = j, d2 = 0;
+        while (o2 >= 0) {
+          if (toks[o2].v === ')') d2++;
+          else if (toks[o2].v === '(') { d2--; if (d2 === 0) break; }
+          o2--;
+        }
+        if (o2 < 0) break;
+        j = o2 - 1; continue;
+      }
+      break;
+    }
+    return j;
+  }
+  function routePathMatches(tmpl, path) {
+    if (tmpl === path) return true;
+    var a = String(tmpl).split('/'), b = String(path).split('/');
+    if (a.length !== b.length) return false;
+    for (var i = 0; i < a.length; i++) {
+      var s = a[i];
+      if (s.length >= 2 && s[0] === '{' && s[s.length - 1] === '}') { if (!b[i].length) return false; continue; }
+      if (s !== b[i]) return false;
+    }
+    return true;
+  }
+  function matchHttpRoute(routes, method, path) {
+    for (var i = 0; i < routes.length; i++) {
+      var r = routes[i];
+      if (r.method !== '*' && r.method !== method) continue;
+      if (routePathMatches(r.path, path)) return r;
+    }
+    return null;
+  }
+  function parseBindAddr(margs, env, fns, st) {
+    var inner = margs.slice();
+    if (inner.length >= 2 && inner[0].v === '(' && matchTok(inner, 0, '(', ')') === inner.length - 1) {
+      inner = inner.slice(1, -1);
+    }
+    var parts = splitArgs(inner).filter(function (a) { return a.length; });
+    try {
+      if (parts.length >= 2) {
+        var host = rustToString(evalExpr(parts[0], env, fns, st).value);
+        var port = Math.floor(num(evalExpr(parts[1], env, fns, st).value));
+        if (!isFinite(port) || port < 0 || port > 65535) return { ok: false, error: 'invalid port in bind address' };
+        return { ok: true, host: host || '127.0.0.1', port: port };
+      }
+      if (parts.length === 1) {
+        var one = evalExpr(parts[0], env, fns, st).value;
+        if (typeof one === 'number') {
+          var p0 = Math.floor(one);
+          if (!isFinite(p0) || p0 < 0 || p0 > 65535) return { ok: false, error: 'invalid port in bind address' };
+          return { ok: true, host: '127.0.0.1', port: p0 };
+        }
+        var s = rustToString(one);
+        var m = /^(.*):(\d+)$/.exec(s);
+        if (m) {
+          var p1 = parseInt(m[2], 10);
+          if (!isFinite(p1) || p1 < 0 || p1 > 65535) return { ok: false, error: 'invalid port in bind address' };
+          return { ok: true, host: m[1] || '127.0.0.1', port: p1 };
+        }
+        var p2 = parseInt(s, 10);
+        if (isFinite(p2) && String(p2) === s.trim()) return { ok: true, host: '127.0.0.1', port: p2 };
+        return { ok: false, error: 'invalid bind address `' + s + '`' };
+      }
+    } catch (eP) { return { ok: false, error: String((eP && eP.message) || eP) }; }
+    return { ok: false, error: 'invalid bind address' };
+  }
+  function httpBodyString(v) {
+    if (v !== null && typeof v === 'object' && v.__rust === 'bytes') return v.raw || '';
+    if (v !== null && typeof v === 'object' && v.__rust === 'vec') {
+      try {
+        if (typeof Buffer !== 'undefined') return Buffer.from(v.items.map(function (x) { return x | 0; })).toString('utf8');
+      } catch (eB) {}
+      return v.items.map(function (x) { return String.fromCharCode(x | 0); }).join('');
+    }
+    return rustToString(v);
+  }
+  function rustToJson(v) {
+    if (v === null || v === undefined) return 'null';
+    if (typeof v === 'string') return JSON.stringify(v);
+    if (typeof v === 'number' || typeof v === 'boolean') return String(v);
+    if (typeof v === 'object') {
+      if (v.__rust === 'bytes') return JSON.stringify(v.raw || '');
+      if (v.__rust === 'vec') return '[' + v.items.map(rustToJson).join(',') + ']';
+      if (v.__rust === 'option') return v.some ? rustToJson(v.value) : 'null';
+      if (v.__rust === 'result') return v.ok ? rustToJson(v.value) : '{"Err":' + rustToJson(v.value) + '}';
+      if (v.__rust === 'struct' && v.fields) {
+        var ks = Object.keys(v.fields);
+        return '{' + ks.map(function (k2) { return JSON.stringify(k2) + ':' + rustToJson(v.fields[k2]); }).join(',') + '}';
+      }
+      if (v.__rust === 'ctor') return JSON.stringify(v.name + '(' + (v.args || []).map(rustToJson).join(', ') + ')');
+    }
+    return JSON.stringify(rustToString(v));
+  }
+  function httpResponseOf(v) {
+    if (v !== null && typeof v === 'object') {
+      if (v.__rust === 'httpresponse') return { status: v.status || 200, body: v.body || '', ctype: v.ctype || 'text/plain; charset=utf-8' };
+      if (v.__rust === 'result') {
+        return v.ok ? httpResponseOf(v.value)
+                    : { status: 500, body: 'Internal Server Error', ctype: 'text/plain; charset=utf-8' };
+      }
+      if (v.__rust === 'option') {
+        return v.some ? httpResponseOf(v.value)
+                      : { status: 200, body: '', ctype: 'text/plain; charset=utf-8' };
+      }
+      if (v.__rust === 'bytes') return { status: 200, body: v.raw || '', ctype: 'application/octet-stream' };
+      if (v.__rust === 'vec') return { status: 200, body: httpBodyString(v), ctype: 'text/plain; charset=utf-8' };
+    }
+    if (typeof v === 'string') return { status: 200, body: v, ctype: 'text/plain; charset=utf-8' };
+    if (typeof v === 'number' || typeof v === 'boolean') return { status: 200, body: String(v), ctype: 'text/plain; charset=utf-8' };
+    if (v === undefined || v === null) return { status: 200, body: '', ctype: 'text/plain; charset=utf-8' };
+    return { status: 200, body: rustToString(v), ctype: 'text/plain; charset=utf-8' };
+  }
+  function startHttpServer(srv, routes, env, fns, stdout, stderr, st) {
+    NET_LISTENING = true;
+    if (st && st.opts && st.opts.noListen) return { ok: true, skipped: true };
+    if (!HTTP_X) return { ok: false, error: 'net unavailable' };
+    var host = srv._host || '127.0.0.1';
+    var port = (srv._port === undefined || srv._port === null) ? 8080 : srv._port;
+    try {
+      var server = HTTP_X.createServer(function (req, res) {
+        dispatchHttpRequest(routes, req, res, env, fns, stdout, stderr, st);
+      });
+      server.on('error', function (eH) {
+        try { if (typeof process !== 'undefined' && process.stderr) process.stderr.write('error: failed to bind listener: ' + ((eH && eH.message) || eH) + '\n'); } catch (eI) {}
+      });
+      server.listen(port, host);
+      TCP_SRVS.push(server);
+      return { ok: true };
+    } catch (eL) { return { ok: false, error: String((eL && eL.message) || eL) }; }
+  }
+  function dispatchHttpRequest(routes, req, res, env, fns, stdout, stderr, st) {
+    var method = 'GET', path = '/';
+    try {
+      method = String(req.method || 'GET').toUpperCase();
+      var url = String(req.url || '/');
+      path = (url.split('?')[0] || '/').split('#')[0] || '/';
+      try { path = decodeURIComponent(path); } catch (eD) {}
+    } catch (eU) {}
+    function send(status, body, ctype) {
+      var b = (body === undefined || body === null) ? '' : String(body);
+      var len = b.length, buf = b;
+      try {
+        if (typeof Buffer !== 'undefined') { buf = Buffer.from(b, 'utf8'); len = buf.length; }
+        else len = b.length;
+      } catch (eB) {}
+      try {
+        res.writeHead(status, { 'Content-Type': ctype || 'text/plain; charset=utf-8', 'Content-Length': len });
+      } catch (eH) { try { res.statusCode = status; } catch (eS) {} }
+      try { res.end(buf); } catch (eE) {}
+    }
+    var hit = null;
+    try { hit = matchHttpRoute(routes, method, path); } catch (eM) { hit = null; }
+    if (!hit) { send(404, 'Not Found'); return; }
+    var handler = fns[hit.handler];
+    if (!handler) { send(500, 'handler not found'); return; }
+    var outMark = stdout.length, errMark = stderr.length, savedSteps = st.steps;
+    st.steps = 0; // fresh execution budget per request (infinite loops still capped)
+    try {
+      var rv = execFnBody(handler, [], env, fns, st);
+      var resp = httpResponseOf(rv && rv.value);
+      send(resp.status, resp.body, resp.ctype);
+    } catch (eX) {
+      if (eX && eX.__frsPanic && process.stderr) { try { process.stderr.write('thread panicked: ' + eX.msg + '\n'); } catch (eW) {} }
+      try { send(500, 'Internal Server Error'); } catch (e5) {}
+    }
+    st.steps = savedSteps;
+    // live-flush handler prints (run() already returned); trim buffer growth
+    try {
+      if (typeof process !== 'undefined') {
+        if (stdout.length > outMark && process.stdout) process.stdout.write(stdout.slice(outMark).join(''));
+        if (stderr.length > errMark && process.stderr) process.stderr.write(stderr.slice(errMark).join(''));
+      }
+      if (stdout.length > 4000) stdout.splice(0, stdout.length - 4000);
+      if (stderr.length > 1000) stderr.splice(0, stderr.length - 1000);
+    } catch (eF) {}
   }
 
   // ---- fn collection: fn name(params) { body } ----
@@ -214,6 +528,33 @@
       }
       return null;
     }
+    // module ranges (`mod foo { ... }`) so `foo::bar()` resolves through qns.
+    // (Merged multi-file crates keep their `mod foo { }` wrappers; see pm merge.)
+    var modRanges = [];
+    (function () {
+      for (var ms = 0; ms < n; ms++) {
+        if (toks[ms].t === T.IDENT && toks[ms].v === 'mod' && ms + 1 < n && toks[ms + 1].t === T.IDENT) {
+          var mname0 = toks[ms + 1].v;
+          for (var mq = ms + 2; mq < Math.min(n, ms + 8); mq++) {
+            if (toks[mq].v === '{') {
+              var me = matchTok(toks, mq, '{', '}');
+              modRanges.push({ name: mname0, start: mq, end: me === -1 ? n : me });
+              break;
+            }
+            if (toks[mq].v === ';') break;
+          }
+        }
+      }
+    })();
+    function modOf(idx) {
+      var best = null;
+      for (var r2 = 0; r2 < modRanges.length; r2++) {
+        if (idx > modRanges[r2].start && idx < modRanges[r2].end) {
+          if (!best || modRanges[r2].start > best.start) best = modRanges[r2];
+        }
+      }
+      return best ? best.name : null;
+    }
     for (var i = 0; i < n; i++) {
       if (toks[i].t === T.IDENT && toks[i].v === 'fn' && i + 1 < n && toks[i + 1].t === T.IDENT) {
         var name = toks[i + 1].v;
@@ -263,6 +604,9 @@
             entry.implT = selfT;
             if (qns && selfT) qns[selfT + '::' + name] = entry;
           }
+          // module-qualified alias so `foo::bar()` resolves after mod merging
+          var modT = modOf(i);
+          if (modT && qns) qns[modT + '::' + name] = entry;
           fns[name] = entry;
         }
       }
@@ -442,17 +786,51 @@
       }
       return end;
     }
-    if (name !== '_') env[name] = val;
+    if (name !== '_') {
+      env[name] = val;
+      trackRefBind(env, name, valToks); // `let r = &x` aliases r -> x (else tombstone)
+    }
     return end;
   }
 
   // ---- expression statement (assign / macro / call) ----
   function execExprStmt(stToks, env, fns, stdout, stderr, st, firstTk) {
     if (!stToks.length) return;
+    // deref assignment: `*r = ...` / `*r += ...` writes through to the
+    // borrow target (`r` aliases it via `let r = &mut x`)
+    if (stToks[0].v === '*') {
+      var dk = 0;
+      while (dk < stToks.length && stToks[dk].v === '*') dk++;
+      if (dk < stToks.length && stToks[dk].t === T.IDENT && !isKw(stToks[dk].v) &&
+          dk + 1 < stToks.length &&
+          (stToks[dk + 1].v === '=' || stToks[dk + 1].v === '+=' || stToks[dk + 1].v === '-=' ||
+           stToks[dk + 1].v === '*=' || stToks[dk + 1].v === '/=' || stToks[dk + 1].v === '%=')) {
+        var dTarget = resolveRef(env, stToks[dk].v);
+        var dRhs = stToks.slice(dk + 2);
+        if (stToks[dk + 1].v === '=') {
+          assignVar(env, dTarget, evalExpr(dRhs, env, fns, st));
+        } else {
+          var dCur = lookupVar(env, dTarget);
+          var dCurV = dCur ? dCur.value : 0;
+          var dRhsV = evalExpr(dRhs, env, fns, st).value;
+          var dOp = stToks[dk + 1].v[0];
+          if (typeof dCurV === 'string' || typeof dRhsV === 'string') {
+            if (dOp !== '+') { dCurV = num(dCurV); dRhsV = num(dRhsV); }
+            else { assignVar(env, dTarget, { value: String(dCurV) + String(dRhsV), type: 'String' }); return; }
+          }
+          var dRes = dOp === '+' ? num(dCurV) + num(dRhsV) : dOp === '-' ? num(dCurV) - num(dRhsV)
+            : dOp === '*' ? num(dCurV) * num(dRhsV) : dOp === '/' ? (num(dRhsV) === 0 ? num(dCurV) : num(dCurV) / num(dRhsV))
+            : num(dCurV) % num(dRhsV);
+          assignVar(env, dTarget, { value: dRes, type: 'i32' });
+        }
+        return;
+      }
+    }
     // assignment: IDENT = ...
     if (stToks.length >= 3 && stToks[0].t === T.IDENT && stToks[1].v === '=' && !isKw(stToks[0].v)) {
       var val = evalExpr(stToks.slice(2), env, fns, st);
       env[stToks[0].v] = val;
+      trackRefBind(env, stToks[0].v, stToks.slice(2)); // reborrow or tombstone
       return;
     }
     if (stToks.length >= 3 && stToks[0].t === T.IDENT && (stToks[1].v === '+=' || stToks[1].v === '-=' || stToks[1].v === '*=' || stToks[1].v === '/=' || stToks[1].v === '%=')) {
@@ -764,6 +1142,67 @@
     return isNaN(n) ? 0 : n;
   }
 
+  // ---- borrow/reference aliasing (`&x`, `&mut x`, `*r`) ----
+  // References evaluate transparently, but `*r = v` / `*r` reads resolve
+  // through per-scope alias cells (`__ref_<name>` -> target name) so that
+  // mutation through `&mut` is observable, like real Rust. Only bare-ident
+  // targets (`&x`, `&mut x`) create aliases; anything else stays transparent.
+  var REF_PREFIX = '__ref_';
+  function refTargetOf(exprToks) {
+    if (!exprToks || !exprToks.length || exprToks[0].v !== '&') return null;
+    var k = 1;
+    if (exprToks[k] && exprToks[k].v === 'mut' && exprToks[k].t === T.IDENT) k++;
+    if (k < exprToks.length && exprToks[k].t === T.IDENT && !isKw(exprToks[k].v) &&
+        k === exprToks.length - 1) return exprToks[k].v;
+    return null;
+  }
+  function findAlias(env, name) {
+    // own-property only (null tombstone shadows outer scopes); null = no alias
+    var key = REF_PREFIX + name, e = env;
+    while (e && e !== Object.prototype) {
+      if (Object.prototype.hasOwnProperty.call(e, key)) return e[key];
+      e = Object.getPrototypeOf(e);
+      if (e === null) break;
+    }
+    return null;
+  }
+  function resolveRef(env, name) {
+    var seen = {}, cur = name, g = 0;
+    while (g++ < 8) {
+      var t = findAlias(env, cur);
+      if (!t || seen[t]) break;
+      seen[cur] = 1; cur = t;
+    }
+    return cur;
+  }
+  function lookupVar(env, name) {
+    var e = env;
+    while (e && e !== Object.prototype) {
+      if (Object.prototype.hasOwnProperty.call(e, name)) return e[name];
+      e = Object.getPrototypeOf(e);
+      if (e === null) break;
+    }
+    return undefined;
+  }
+  function assignVar(env, name, val) {
+    // write to the scope that owns the binding (outer `let` through `&mut`)
+    var e = env;
+    while (e && e !== Object.prototype) {
+      if (Object.prototype.hasOwnProperty.call(e, name)) { e[name] = val; return; }
+      e = Object.getPrototypeOf(e);
+      if (e === null) break;
+    }
+    env[name] = val;
+  }
+  function trackRefBind(env, boundName, rhsToks) {
+    if (boundName === '_' || !boundName) return;
+    var tgt = refTargetOf(rhsToks);
+    try {
+      if (tgt) env[REF_PREFIX + boundName] = tgt;
+      else env[REF_PREFIX + boundName] = null; // tombstone: shadows outer alias
+    } catch (eT) {}
+  }
+
   // ---- expression evaluator (literals, vars, arith, comparisons, calls, vec, format) ----
   function evalExpr(toks, env, fns, st) {
     if (!toks.length) return { value: 0, type: 'i32' };
@@ -771,31 +1210,31 @@
     // trim trailing `,`/`;`
     while (toks.length && (toks[toks.length - 1].v === ',' || toks[toks.length - 1].v === ';')) toks = toks.slice(0, -1);
     if (!toks.length) return { value: 0, type: 'i32' };
-    // try-operator `?`: unwrap Result/Option, propagate Err via throw
-    var tailQ = false;
-    if (toks.length >= 2 && toks[toks.length - 1].v === '?') { tailQ = true; toks = toks.slice(0, -1); }
-    var hasQ = false;
-    for (var qi = 0; qi < toks.length; qi++) { if (toks[qi].v === '?') { hasQ = true; break; } }
-    if (hasQ) {
-      var tq = [];
-      for (var qi2 = 0; qi2 < toks.length; qi2++) { if (toks[qi2].v !== '?') tq.push(toks[qi2]); }
-      toks = tq;
+    // try-operator `?`: split at the FIRST depth-0 `?` (it binds tighter than
+    // method chains: `a()?.b()` == `(a()?) .b()`), unwrap-or-throw, and continue
+    // with the remainder. `?` inside brackets belongs to that sub-expression
+    // and is left for its own recursive evaluation.
+    var qd = 0, qi = -1;
+    for (var qk = 0; qk < toks.length; qk++) {
+      var qqv = toks[qk].v;
+      if (qqv === '(' || qqv === '[' || qqv === '{') qd++;
+      else if (qqv === ')' || qqv === ']' || qqv === '}') qd--;
+      else if (qqv === '?' && qd === 0) { qi = qk; break; }
     }
-    if (tailQ) {
-      var innerR = evalExpr(toks, env, fns, st);
-      if (innerR.value !== null && typeof innerR.value === 'object' && innerR.value.__rust === 'result' && !innerR.value.ok) {
-        throw { __frsTryErr: true, value: innerR.value.value };
+    if (qi !== -1) {
+      var leftQ = evalExpr(toks.slice(0, qi), env, fns, st);
+      var lv = leftQ.value;
+      if (lv !== null && typeof lv === 'object' && lv.__rust === 'result' && !lv.ok) {
+        throw { __frsTryErr: true, value: lv.value };
       }
-      if (innerR.value !== null && typeof innerR.value === 'object' && innerR.value.__rust === 'option' && !innerR.value.some) {
+      if (lv !== null && typeof lv === 'object' && lv.__rust === 'option' && !lv.some) {
         throw { __frsTryErr: true, value: undefined };
       }
-      if (innerR.value !== null && typeof innerR.value === 'object' && innerR.value.__rust === 'result' && innerR.value.ok) {
-        return { value: innerR.value.value, type: 'unknown' };
-      }
-      if (innerR.value !== null && typeof innerR.value === 'object' && innerR.value.__rust === 'option' && innerR.value.some) {
-        return { value: innerR.value.value, type: 'unknown' };
-      }
-      return innerR;
+      if (lv !== null && typeof lv === 'object' && lv.__rust === 'result' && lv.ok) lv = lv.value;
+      else if (lv !== null && typeof lv === 'object' && lv.__rust === 'option' && lv.some) lv = lv.value;
+      if (qi === toks.length - 1) return { value: lv, type: 'unknown' }; // trailing `?`
+      env.__tryVal = { value: lv, type: 'unknown' };
+      return evalExpr([{ t: T.IDENT, v: '__tryVal', idx: 0, line: toks[qi].line, col: toks[qi].col }].concat(toks.slice(qi + 1)), env, fns, st);
     }
 
     // block expr: { stmts } -> value of last expr (tail) or ()
@@ -1068,22 +1507,90 @@
         }
         return { value: 0, type: 'unknown' };
       }
-      // OpenOptions chain
+      // OpenOptions chain (std + tokio::fs share the `OpenOptions::new()` shape)
       if (base && typeof base === 'object' && base.__rust === 'openoptions' && FS_X) {
         var o_append = base._append === true;
         if (mname === 'append') { base._append = !!margVals[0]; if (dotCall.close < toks.length - 1) return finishMethodResult(base, toks.slice(dotCall.close + 1), env, fns, st); return { value: base, type: 'OpenOptions' }; }
         if (mname === 'truncate') { base._truncate = !!margVals[0]; if (dotCall.close < toks.length - 1) return finishMethodResult(base, toks.slice(dotCall.close + 1), env, fns, st); return { value: base, type: 'OpenOptions' }; }
+        if (mname === 'create') { base._create = !!margVals[0]; if (dotCall.close < toks.length - 1) return finishMethodResult(base, toks.slice(dotCall.close + 1), env, fns, st); return { value: base, type: 'OpenOptions' }; }
+        if (mname === 'create_new') { base._createNew = !!margVals[0]; if (dotCall.close < toks.length - 1) return finishMethodResult(base, toks.slice(dotCall.close + 1), env, fns, st); return { value: base, type: 'OpenOptions' }; }
+        if (mname === 'write') { base._write = !!margVals[0]; if (dotCall.close < toks.length - 1) return finishMethodResult(base, toks.slice(dotCall.close + 1), env, fns, st); return { value: base, type: 'OpenOptions' }; }
+        if (mname === 'read') { base._read = !!margVals[0]; if (dotCall.close < toks.length - 1) return finishMethodResult(base, toks.slice(dotCall.close + 1), env, fns, st); return { value: base, type: 'OpenOptions' }; }
         if (mname === 'open') {
           var o_path = (splitArgs(margs).filter(function (a) { return a.length; })[0] || []);
           var o_pv = o_path.length ? evalExpr(o_path, env, fns, st).value : '';
-          var o_flags = base._append ? 'a' : (base._truncate ? 'w' : 'r+');
+          var o_name = String(o_pv);
+          var oRes;
           try {
-            var o_fd = FS_X.openSync(String(o_pv), o_flags);
+            var o_exists = false;
+            try { FS_X.accessSync(o_name); o_exists = true; } catch (eA) { o_exists = false; }
+            if (base._createNew && o_exists) throw new Error('File exists (os error 17)');
+            if ((base._create || base._createNew || base._append) && !o_exists) FS_X.writeFileSync(o_name, '');
+            var o_flags = base._append ? 'a' : (base._truncate ? 'w' : (base._write ? (o_exists ? 'r+' : 'w') : 'r'));
+            var o_fd = FS_X.openSync(o_name, o_flags);
             openFds.push(o_fd);
-            return { value: { __rust: 'result', ok: true, value: { __rust: 'file', _fd: o_fd, path: String(o_pv) } }, type: 'Result' };
+            oRes = { __rust: 'result', ok: true, value: { __rust: 'file', _fd: o_fd, path: o_name } };
           } catch (eO) {
-            return { value: { __rust: 'result', ok: false, value: String(eO.message || eO) }, type: 'Result' };
+            oRes = { __rust: 'result', ok: false, value: String(eO.message || eO) };
           }
+          if (dotCall.close < toks.length - 1) return finishMethodResult(oRes, toks.slice(dotCall.close + 1), env, fns, st);
+          return { value: oRes, type: 'Result' };
+        }
+      }
+      // ---- actix-web HttpServer builder chain: .bind(addr)? .workers(n) .run().await ----
+      if (base && typeof base === 'object' && base.__rust === 'httpserver') {
+        if (mname === 'bind') {
+          var bnd = parseBindAddr(margs, env, fns, st);
+          var nb = { __rust: 'httpserver', _factory: base._factory, _host: bnd.host, _port: bnd.port };
+          var nbRes = bnd.ok ? { __rust: 'result', ok: true, value: nb }
+                             : { __rust: 'result', ok: false, value: bnd.error };
+          if (dotCall.close < toks.length - 1) return finishMethodResult(nbRes, toks.slice(dotCall.close + 1), env, fns, st);
+          return { value: nbRes, type: 'Result<HttpServer>' };
+        }
+        if (mname === 'workers' || mname === 'worker' || mname === 'shutdown_timeout' || mname === 'disable_signals' || mname === 'keep_alive') {
+          if (dotCall.close < toks.length - 1) return finishMethodResult(base, toks.slice(dotCall.close + 1), env, fns, st);
+          return { value: base, type: 'HttpServer' };
+        }
+        if (mname === 'run') {
+          var routes = (st && st.routes) || [];
+          var stOut = (st && st.stdout) || { push: function () {} };
+          var stErr = (st && st.stderr) || { push: function () {} };
+          var runOut = startHttpServer(base, routes, env, fns, stOut, stErr, st);
+          var runRes = runOut.ok ? { __rust: 'result', ok: true, value: 0 }
+                                 : { __rust: 'result', ok: false, value: runOut.error || 'bind failed' };
+          if (dotCall.close < toks.length - 1) return finishMethodResult(runRes, toks.slice(dotCall.close + 1), env, fns, st);
+          return { value: runRes, type: 'Result' };
+        }
+      }
+      // ---- actix-web HttpResponse builder: .body(x) .json(x) .finish() .status(n) ----
+      if (base && typeof base === 'object' && base.__rust === 'httpresponse') {
+        if (mname === 'body') {
+          base.body = httpBodyString(margVals.length ? margVals[0] : '');
+          if (dotCall.close < toks.length - 1) return finishMethodResult(base, toks.slice(dotCall.close + 1), env, fns, st);
+          return { value: base, type: 'HttpResponse' };
+        }
+        if (mname === 'json') {
+          base.body = rustToJson(margVals.length ? margVals[0] : 0);
+          base.ctype = 'application/json';
+          if (dotCall.close < toks.length - 1) return finishMethodResult(base, toks.slice(dotCall.close + 1), env, fns, st);
+          return { value: base, type: 'HttpResponse' };
+        }
+        if (mname === 'finish' || mname === 'build') {
+          base.body = '';
+          if (dotCall.close < toks.length - 1) return finishMethodResult(base, toks.slice(dotCall.close + 1), env, fns, st);
+          return { value: base, type: 'HttpResponse' };
+        }
+        if (mname === 'status') {
+          var sc0 = margVals.length ? margVals[0] : 0;
+          var scn = (typeof sc0 === 'number') ? sc0 : parseInt(rustToString(sc0), 10);
+          if (isFinite(scn) && scn >= 100 && scn <= 599) base.status = scn;
+          if (dotCall.close < toks.length - 1) return finishMethodResult(base, toks.slice(dotCall.close + 1), env, fns, st);
+          return { value: base, type: 'HttpResponse' };
+        }
+        if (mname === 'content_type' || mname === 'append_header' || mname === 'insert_header') {
+          if (mname === 'content_type' && margVals.length) base.ctype = rustToString(margVals[0]);
+          if (dotCall.close < toks.length - 1) return finishMethodResult(base, toks.slice(dotCall.close + 1), env, fns, st);
+          return { value: base, type: 'HttpResponse' };
         }
       }
       // file/tcpstream read/write_all
@@ -1216,19 +1723,41 @@
     if (fdot !== -1) {
       var fbase = evalExpr(toks.slice(0, fdot), env, fns, st).value;
       var ff = toks[fdot + 1].v;
+      // `.await` is a transparent no-op: async runs synchronously in this engine
+      // (tokio/actix futures execute inline; `x.await?` still unwraps via `?`).
+      if (ff === 'await') return finishMethodResult(fbase, toks.slice(fdot + 2), env, fns, st);
       var fvv = (fbase !== null && typeof fbase === 'object' && fbase.__rust === 'struct' &&
         Object.prototype.hasOwnProperty.call(fbase.fields, ff)) ? fbase.fields[ff] : 0;
       var frest = toks.slice(fdot + 2);
       if (!frest.length) return { value: fvv, type: 'unknown' };
       return finishMethodResult(fvv, frest, env, fns, st);
     }
-    // unary: ! - &
+    // unary: ! - & *
     if (toks[0].v === '!') return { value: truthy(evalExpr(toks.slice(1), env, fns, st).value) ? false : true, type: 'bool' };
     if (toks[0].v === '-' && toks.length > 1) {
       var iv = evalExpr(toks.slice(1), env, fns, st);
       return { value: -num(iv.value), type: iv.type };
     }
-    if (toks[0].v === '&') return evalExpr(toks.slice(1), env, fns, st);
+    if (toks[0].v === '&') {
+      // `&mut x` has a `mut` marker token — skip it, references are transparent
+      var aInner = toks.slice(1);
+      if (aInner.length && aInner[0].v === 'mut' && aInner[0].t === T.IDENT) aInner = aInner.slice(1);
+      return evalExpr(aInner, env, fns, st);
+    }
+    if (toks[0].v === '*') {
+      // deref: `*r` reads through the borrow target so `&mut` stays fresh
+      var dd = 1;
+      while (dd < toks.length && toks[dd].v === '*') dd++;
+      if (dd < toks.length && toks[dd].t === T.IDENT && !isKw(toks[dd].v)) {
+        var real = resolveRef(env, toks[dd].v);
+        var got = lookupVar(env, real);
+        var dv = got !== undefined ? got.value : 0;
+        var restD = toks.slice(dd + 1);
+        if (!restD.length) return { value: dv, type: 'unknown' };
+        return finishMethodResult(dv, restD, env, fns, st);
+      }
+      return evalExpr(toks.slice(dd), env, fns, st);
+    }
 
     // parens
     if (toks[0].v === '(' && matchTok(toks, 0, '(', ')') === toks.length - 1) {
@@ -1254,7 +1783,9 @@
         if (s.v === 'true') return { value: true, type: 'bool' };
         if (s.v === 'false') return { value: false, type: 'bool' };
         if (s.v === 'None') return { value: { __rust: 'option', some: false }, type: 'unknown' };
-        if (env[s.v] !== undefined) return env[s.v];
+        // reads follow `&x` aliases so shared refs stay fresh
+        var gotS = lookupVar(env, resolveRef(env, s.v));
+        if (gotS !== undefined) return gotS;
         return { value: 0, type: 'unknown' };
       }
     }
@@ -1279,7 +1810,10 @@
       return { value: { __rust: 'vec', items: rr }, type: 'Vec<_>' };
     }
     // fallback: first token value
-    if (toks[0].t === T.IDENT && env[toks[0].v] !== undefined) return env[toks[0].v];
+    if (toks[0].t === T.IDENT) {
+      var gotF = lookupVar(env, resolveRef(env, toks[0].v));
+      if (gotF !== undefined) return gotF;
+    }
     return { value: 0, type: 'unknown' };
   }
 
@@ -1478,6 +2012,7 @@
     var cchild = Object.create(env);
     for (var cp = 0; cp < cv.params.length; cp++) {
       cchild[cv.params[cp]] = cp < argVals.length ? argVals[cp] : { value: 0, type: 'unknown' };
+      try { cchild[REF_PREFIX + cv.params[cp]] = null; } catch (eC) {}
     }
     try { return evalExpr(cv.body.slice(), cchild, fns, st); }
     catch (e2) {
@@ -1491,6 +2026,7 @@
     for (var cp2 = 0; cp2 < cv.params.length; cp2++) {
       cchild[cv.params[cp2]] = (cp2 < cparts.length && cparts[cp2].length)
         ? evalExpr(cparts[cp2], env, fns, st) : { value: 0, type: 'unknown' };
+      trackRefBind(cchild, cv.params[cp2], cp2 < cparts.length ? cparts[cp2] : []);
     }
     try { return evalExpr(cv.body.slice(), cchild, fns, st); }
     catch (e2) {
@@ -1520,6 +2056,18 @@
   // qualified path call: Type::method(args) — exact impl match, else builtin/lenient
   function callPath(typeName, methodName, argToks, env, fns, qns, st, tk) {
     var q = qns[typeName + '::' + methodName];
+    if (!q && (typeName === 'super' || typeName === 'crate' || typeName === 'self')) {
+      // relative path: `super::helper()`, `crate::util()` — resolve leniently
+      var ff = fns[methodName];
+      if (ff && !ff.impl) return execFnBody(ff, argToks, env, fns, st);
+      for (var qk in qns) {
+        if (qk.length > methodName.length + 2 &&
+            qk.slice(qk.length - methodName.length - 2) === '::' + methodName) {
+          q = qns[qk];
+          break;
+        }
+      }
+    }
     if (q) return execFnBody(q, argToks, env, fns, st);
     // real file/socket I/O backed by Node fs/net (when available)
     if (FS_X) {
@@ -1556,6 +2104,17 @@
           return { value: { __rust: 'tcplistener', _srv: netSrv }, type: 'TcpListener' };
         } catch (eN) { return { value: { __rust: 'result', ok: false, value: String(eN.message || eN) }, type: 'Result' }; }
       }
+      // actix-web style: HttpServer::new(factory) captures the app factory;
+      // `.bind(addr)?` + `.run().await` starts a real Node http server.
+      // (The factory closure is never executed: routes come from `#[get]` attrs
+      // and `.service/.route` registrations, see collectRoutes.)
+      if (typeName === 'HttpServer' && methodName === 'new') {
+        return { value: { __rust: 'httpserver', _factory: argToks.slice(), _host: null, _port: null }, type: 'HttpServer' };
+      }
+      // actix-web style: HttpResponse::Ok() / ::NotFound() / ... status builders.
+      if (typeName === 'HttpResponse' && HTTP_STATUS[methodName] !== undefined) {
+        return { value: { __rust: 'httpresponse', status: HTTP_STATUS[methodName], body: '', ctype: 'text/plain; charset=utf-8' }, type: 'HttpResponse' };
+      }
       if (typeName === 'BufReader' && methodName === 'new') {
         var brows = splitArgs(argToks).filter(function (a) { return a.length; });
         var brv = brows.length ? evalExpr(brows[0], env, fns, st).value : null;
@@ -1567,7 +2126,7 @@
       if (typeName === 'io' && methodName === 'stdout') return { value: { __rust: 'stdout' }, type: 'Stdout' };
     }
     if (typeName === 'OpenOptions' && methodName === 'new') {
-      return { value: { __rust: 'openoptions', _append: false, _truncate: false }, type: 'OpenOptions' };
+      return { value: { __rust: 'openoptions', _append: false, _truncate: false, _create: false, _createNew: false, _write: false, _read: false }, type: 'OpenOptions' };
     }
     if (typeName === 'String' && (methodName === 'from_utf8_lossy' || methodName === 'from_utf8' || methodName === 'from_utf8_unchecked')) {
       var fa = splitArgs(argToks).filter(function (a) { return a.length; });
@@ -1628,6 +2187,8 @@
       var ai = p - (hasSelf ? 1 : 0) + (hasSelf ? (selfVal !== undefined ? 0 : 1) : 0);
       var pv = (ai >= 0 && ai < parts2.length && parts2[ai].length) ? evalExpr(parts2[ai], env, fns, st) : { value: 0, type: 'unknown' };
       child[fn.params[p]] = pv;
+      // `foo(&mut h)` aliases param -> caller's var so `*s = ...` writes back
+      trackRefBind(child, fn.params[p], (ai >= 0 && ai < parts2.length) ? parts2[ai] : []);
     }
     var O3 = st.stdout || { push: function () { } };
     var E3 = st.stderr || { push: function () { } };
@@ -1665,12 +2226,24 @@
   }
 
   function findStmtStart(inner) {
-    // find start of last `;`-separated statement
-    var d = 0;
+    // find start of last `;`-separated statement — or the statement following
+    // a block-tailed statement (`if/for/while/loop/match/{...}` needs no `;`).
+    var d = 0, blockEnd = -1;
     for (var i = inner.length - 1; i >= 0; i--) {
       var v = inner[i].v;
-      if (v === ')' || v === ']' || v === '}') d++;
-      else if (v === '(' || v === '[' || v === '{') d--;
+      if (v === ')' || v === ']' || v === '}') {
+        if (v === '}' && d === 0) blockEnd = i;
+        d++;
+      }
+      else if (v === '(' || v === '[' || v === '{') {
+        d--;
+        if (v === '{' && d === 0 && blockEnd !== -1) {
+          var t = blockEnd + 1;
+          if (inner[t] && inner[t].v === ';') t++;
+          if (t < inner.length) return t; // code follows the block: split here
+          blockEnd = -1; // the block IS the tail (trailing if/match value): keep looking
+        }
+      }
       else if (d === 0 && v === ';') return i + 1;
     }
     return 0;
