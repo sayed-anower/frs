@@ -1,0 +1,32 @@
+{
+  "name": "mime",
+  "version": "0.3.17",
+  "crate": "mime-0.3.17",
+  "libPath": "/public/frs/du/frs_target/registry/src/mime-0.3.17/src/lib.rs",
+  "files": [
+    "src/lib.rs",
+    "src/parse.rs"
+  ],
+  "ok": false,
+  "errCount": 38,
+  "exports": [
+    "Mime",
+    "MimeIter",
+    "Name",
+    "FromStrError",
+    "type_",
+    "subtype",
+    "suffix",
+    "get_param",
+    "params",
+    "essence_str",
+    "as_str",
+    "Params",
+    "TEXT_JAVSCRIPT",
+    "ParseError",
+    "new",
+    "parse"
+  ],
+  "deps": [],
+  "compiledAt": "2026-10-05T20:17:15.358Z"
+}

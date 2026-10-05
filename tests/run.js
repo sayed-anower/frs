@@ -145,6 +145,26 @@ t('negated field assign', 'struct T { on: bool } fn main() { let mut t = T { on:
 
 console.log('\n' + passed + ' passed, ' + failed + ' failed (incl. acceptance)');
 
+// ---- rustc-parity structural errors (prompt.txt listed them as FIXED) ----
+tc('use of non-existent std module', 'use std::Checking_If_Error; fn main() {}', { ok: false, errContains: 'not a std module' });
+tc('auto-known-type variants pass', 'use std::collections::{HashMap, HashSet}; fn main() { let mut h: HashMap<i32, i32> = HashMap::new(); h.insert(1, 2); let mut s: HashSet<i32> = HashSet::new(); s.insert(1); }', { ok: true });
+tc('unknown field in struct literal', 'struct u { i: i8 } fn main() { let user = u { id: 3 }; }', { ok: false, errContains: 'no field `id`' });
+tc('known field ok', 'struct u2 { id: i8 } fn main() { let u1 = u2 { id: 3 }; }', { ok: true });
+tc('missing comma in literal', 'struct User { id: i8 } fn main() { let u = User { id: 2 id: 4 }; }', { ok: false, errContains: 'missing comma' });
+tc('unknown literal struct name', 'fn main() { let u33 = Use {}; }', { ok: false, errContains: 'cannot find struct' });
+tc('duplicate field in def', 'struct User { id: i8, id: i4; } fn main() {}', { ok: false, errContains: 'expected `,`' });
+tc('field type unknown', 'struct u { i: i4 } fn main() {}', { ok: false, errContains: 'cannot find type `i4`' });
+tc('real std returns...', 'fn d() -> &str { let a: i8 = 5; a } fn main() {}', { ok: false, errContains: 'mismatched types' });
+tc('int literal overflow', 'fn main() { let a: i8 = 5000000000000; }', { ok: false, errContains: 'literal out of range' });
+tc('invalid placeholder', 'fn d() -> i32 { 9 } fn main() { println!("eu {d()}", d()); }', { ok: false, errContains: 'invalid format string' });
+tc('array push', 'fn main() { let a = [33]; a.push(4); }', { ok: false, errContains: 'no `push`' });
+tc('Display trait missing', 'struct User { x: i32 } fn main() { let user = User { x: 1 }; println!("{}", user); }', { ok: false, errContains: 'Display' });
+tc('T Display ok on primitives', 'fn main() { println!("{}", 42); }', { ok: true });
+tc('unknown crate for std leaves', 'use std::io::Reader; fn main() {}', { ok: true });
+tc('file: line!/column! macros', 'fn main() { let _l = line!(); let _c = column!(); let _m = module_path!(); }', { ok: true });
+t('debug on enum with struct variant', '#[derive(Debug)] enum S { Active, Pending { timeout: u32 } } fn main() { let s = S::Pending { timeout: 30 }; println!("{:?}", s); }', { ok: true, stdout: 'Pending { timeout: 30 }\n' });
+tc('m+1', 'fn main() { let v = vec![1,2]; println!("{}", v); }', { ok: false, errContains: 'Display' });
+
 // ---- interactive terminal input: prompts flush live, reads block per line ----
 // (spawns a child that fakes TTY flags with piped keystrokes standing in for
 // typed lines — byte-wise reads behave identically on a real terminal)

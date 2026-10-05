@@ -133,6 +133,15 @@ Dependencies declared in [dependencies] within Cargo.toml are fetched from [http
 | T015/T016 | — | Invalid placement of break/continue or return statements |
 | T017 | E0255 | Duplicate function definition within scope |
 | T018 | E0433 | `use` of a crate that is not a dependency (project mode only) |
+| T019 | E0433 | `use std::not_real_module` — the std path segment must be a real std module |
+| T020 | E0433 | `Foo::bar()` path call whose leading segment does not resolve (typo'd std path, undeclared type) |
+| T021 | E0080 | Integer literal does not fit the annotated integer type (checked for i8/i16/i32/u8/u16/u32) |
+| T022 | E0412/E0308 | fn parameter/return types must be known; tail value must match the declared return type |
+| T023 | E0599 | Calling a vector growable method (`push`/`pop`/`insert`/...) on a fixed-size array — invalid |
+| T024 | E0277 | `{}` on a type without a Display impl (struct/enum/Vec/Option/Result/collections/tuple) — use `{:?}` |
+| T025 | — | Invalid format placeholder inside println!/format! args (`{d()}`, `{a(, ...`) |
+| T026 | — | Struct/enum definition + struct literal checks: duplicate fields, `,` separators, known field names, known field types |
+| R023 | — | Call/macro expression statements must end with `;` |
 | B001 | E0382 | Use of a moved value (`let y = x`, by-value args, `drop(x)`) |
 | B002 | E0499 | Two live `&mut` borrows of the same value |
 | B003 | E0502 | Use/mutation while incompatibly borrowed (both directions) |

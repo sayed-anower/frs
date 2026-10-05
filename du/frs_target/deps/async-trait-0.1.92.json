@@ -1,0 +1,43 @@
+{
+  "name": "async-trait",
+  "version": "0.1.92",
+  "crate": "async-trait-0.1.92",
+  "libPath": "/public/frs/du/frs_target/registry/src/async-trait-0.1.92/src/lib.rs",
+  "files": [
+    "src/lib.rs",
+    "src/args.rs",
+    "src/bound.rs",
+    "src/expand.rs",
+    "src/lifetime.rs",
+    "src/parse.rs",
+    "src/receiver.rs",
+    "src/verbatim.rs"
+  ],
+  "ok": false,
+  "errCount": 63,
+  "exports": [
+    "Trait",
+    "make",
+    "async_trait",
+    "Args",
+    "Supertraits",
+    "InferredBound",
+    "has_bound",
+    "expand",
+    "CollectLifetimes",
+    "new",
+    "AddLifetimeToImplTrait",
+    "Item",
+    "has_self_in_sig",
+    "has_self_in_block",
+    "mut_pat",
+    "ReplaceSelf",
+    "VerbatimFn"
+  ],
+  "deps": [
+    "proc-macro2",
+    "quote",
+    "syn"
+  ],
+  "compiledAt": "2026-10-05T20:16:53.914Z"
+}

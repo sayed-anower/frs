@@ -1,0 +1,20 @@
+{
+  "name": "unicode-ident",
+  "version": "1.0.26",
+  "crate": "unicode-ident-1.0.26",
+  "libPath": "/public/frs/du/frs_target/registry/src/unicode-ident-1.0.26/src/lib.rs",
+  "files": [
+    "src/lib.rs",
+    "src/tables.rs"
+  ],
+  "ok": false,
+  "errCount": 6,
+  "exports": [
+    "TrieSet",
+    "is_xid_start",
+    "is_xid_continue",
+    "UNICODE_VERSION"
+  ],
+  "deps": [],
+  "compiledAt": "2026-10-05T20:17:12.168Z"
+}

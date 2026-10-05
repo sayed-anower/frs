@@ -1,4 +1,4 @@
-/* frs/src/util.js — tiny fast helpers. Pure JS, no deps. Works in Node + browsers. */
+/* frs/src/util.js — tiny fast helpers. Works in Node + browsers. */
 (function (root, factory) {
   if (typeof module !== 'undefined' && module.exports) module.exports = factory();
   else root.FRS_util = factory();

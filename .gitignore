@@ -1,3 +1,4 @@
 *.session
+*.keys
 prompt.txt
 test.*

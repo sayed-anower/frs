@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-/* frs — CLI mimicking rustc. Pure JS, zero deps. */
+/* frs — CLI mimicking rustc. */
 'use strict';
 var fs = require('fs');
 var path = require('path');

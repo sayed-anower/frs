@@ -1140,7 +1140,9 @@
           else if (env[nm] !== undefined) val = env[nm].value;
           else val = '';
         }
-        out += rustDisplay(val, inside);
+        // `{x}` passes the name, not a spec: only `:...` is a format spec
+        var spec = inside.slice(inside.indexOf(':') !== -1 ? inside.indexOf(':') : inside.length);
+        out += rustDisplay(val, spec);
         k = e;
         continue;
       }
@@ -1149,21 +1151,86 @@
     return out;
   }
 
+  // Specs: `''`, `':?'`, `':#?'`, `':.2'`, `':04'`, `':x'`, `':X'`,
+  // `':b'`, `':o'`, `':?'`, `':#?'`, `':e'` … Uniform for all macros.
+  function parseFmtSpec(spec) {
+    var s = (spec || '').trim();
+    if (s.charAt(0) === ':') s = s.slice(1);
+    var hash = false, zero = false, width = 0, prec = -1, type = '';
+    var i = 0;
+    if (s[i] === '#') { hash = true; i++; }
+    if (s[i] === '0' && /\d/.test(s[i + 1] || '')) { zero = true; i++; }
+    var wm = /^(\d+)/.exec(s.slice(i));
+    if (wm) { width = parseInt(wm[1], 10); i += wm[1].length; }
+    var pm = /^\.(\d+)/.exec(s.slice(i));
+    if (pm) { prec = parseInt(pm[1], 10); i += pm[0].length; }
+    type = s.slice(i).charAt(0);
+    return { hash: hash, zero: zero, width: width, prec: prec, type: type };
+  }
+
+  function applyNumSpec(v, spec) {
+    if (typeof v !== 'number' && typeof v !== 'boolean-string') return null;
+    var p = parseFmtSpec(spec);
+    if (typeof v !== 'number') return null;
+    var n = v;
+    if (p.type === 'b') return padSpec(Math.trunc(n).toString(2), p);
+    if (p.type === 'o') return padSpec(Math.trunc(n).toString(8), p);
+    if (p.type === 'x') return padSpec(Math.trunc(n).toString(16), p);
+    if (p.type === 'X') return padSpec(Math.trunc(n).toString(16).toUpperCase(), p);
+    if (p.type === 'e') return padSpec(n.toExponential(p.prec >= 0 ? p.prec : undefined), p);
+    if (p.type === 'E') return padSpec(n.toExponential(p.prec >= 0 ? p.prec : undefined).toUpperCase(), p);
+    if (p.prec >= 0) return padSpec(n.toFixed(p.prec), p);
+    if (p.width > 0 && p.zero) {
+      var s0 = String(n);
+      var neg0 = s0.charAt(0) === '-';
+      var body0 = neg0 ? s0.slice(1) : s0;
+      while (body0.length + (neg0 ? 1 : 0) < p.width) body0 = '0' + body0;
+      return (neg0 ? '-' : '') + body0;
+    }
+    return null;
+  }
+
+  function padSpec(s, p) {
+    if (p.width > s.length && p.zero) return ('0'.repeat(p.width - s.length)) + s;
+    if (p.width > s.length) return ' '.repeat(p.width - s.length) + s;
+    return s;
+  }
+
   function rustDisplay(val, spec) {
     if (val !== null && typeof val === 'object' && val.__rust === 'struct') {
-      var ks = Object.keys(val.fields);
-      return val.name + ' { ' + ks.map(function (k) { return k + ': ' + rustDebug(val.fields[k]); }).join(', ') + ' }';
+      var ps = parseFmtSpec(spec);
+      if (ps.type === '?' && ps.hash) return rustDebugPretty(val);
+      return val.name + ' { ' + Object.keys(val.fields).map(function (k) { return k + ': ' + rustDebug(val.fields[k]); }).join(', ') + ' }';
+    }
+    if (val !== null && typeof val === 'object' && val.__rust === 'enum') {
+      var ep = parseFmtSpec(spec);
+      if (ep.type === '?' && ep.hash) return rustDebugPretty(val);
+      return rustDebug(val);
     }
     if (val !== null && typeof val === 'object' && val.__rust === 'vec') {
-      if ((spec || '').indexOf('?') !== -1 || (spec || '').indexOf('#') !== -1) {
-        return '[' + val.items.map(function (x) { return rustDebug(x); }).join(', ') + ']';
+      var vs = parseFmtSpec(spec);
+      var isTup = val.type === 'tuple';
+      if (vs.type === '?' && vs.hash) return rustDebugPretty(val);
+      if (vs.type === '?') {
+        var items = val.items.map(function (x) { return rustDebug(x); }).join(', ');
+        return isTup ? '(' + items + ')' : '[' + items + ']';
       }
-      return '[' + val.items.map(function (x) { return rustToString(x); }).join(', ') + ']';
+      var items2 = val.items.map(function (x) { return rustToString(x); }).join(', ');
+      return isTup ? '(' + items2 + ')' : '[' + items2 + ']';
     }
-    if ((spec || '').indexOf('?') !== -1) return rustDebug(val);
-    // float precision `{:.2}` (widths still render plainly)
-    var pm = /\.(\d+)/.exec(spec || '');
-    if (pm && typeof val === 'number' && isFinite(val)) return val.toFixed(parseInt(pm[1], 10));
+    if (val !== null && typeof val === 'object' && (val.__rust === 'hashmap' || val.__rust === 'hashset' || val.type === 'HashMap' || val.type === 'BTreeMap' || val.type === 'HashSet' || val.type === 'BTreeSet')) {
+      var ps2 = parseFmtSpec(spec);
+      if (ps2.type === '?' && ps2.hash) return rustDebugPretty(val);
+      if (ps2.type === '?') return rustDebug(val);
+      return rustToString(val);
+    }
+    var ps3 = parseFmtSpec(spec);
+    if (ps3.type === '?') {
+      if (ps3.hash) return rustDebugPretty(val);
+      return rustDebug(val);
+    }
+    var numFmt = applyNumSpec(val, spec);
+    if (numFmt !== null) return numFmt;
     return rustToString(val);
   }
 
@@ -1171,16 +1238,25 @@
     if (v === true) return 'true';
     if (v === false) return 'false';
     if (v === null || v === undefined) return '';
-    if (typeof v === 'object' && v.__rust === 'vec') return '[' + v.items.map(rustToString).join(', ') + ']';
+    if (typeof v === 'object' && v.__rust === 'vec') {
+      var itemsS = v.items.map(rustToString).join(', ');
+      return v.type === 'tuple' ? '(' + itemsS + ')' : '[' + itemsS + ']';
+    }
     if (typeof v === 'object' && v.__rust === 'option') return v.some ? rustToString(v.value) : '';
     if (typeof v === 'object' && v.__rust === 'result') return rustToString(v.value);
-    if (typeof v === 'object' && v.__rust === 'enum') return v.path;
+    if (typeof v === 'object' && v.__rust === 'enum') return enumRustName(v);
     if (typeof v === 'object' && v.__rust === 'ctor') {
       return v.name + '(' + v.args.map(rustToString).join(', ') + ')';
     }
     if (typeof v === 'object' && v.__rust === 'struct') {
       var ks = Object.keys(v.fields);
       return v.name + ' { ' + ks.map(function (k) { return k + ': ' + rustToString(v.fields[k]); }).join(', ') + ' }';
+    }
+    if (typeof v === 'object' && v.__rust === 'hashmap') {
+      return '{' + v.items.map(function (kv) { return rustToString(kv[0]) + ': ' + rustToString(kv[1]); }).join(', ') + '}';
+    }
+    if (typeof v === 'object' && v.__rust === 'hashset') {
+      return '{' + v.items.map(rustToString).join(', ') + '}';
     }
     if (typeof v === 'number') {
       if (!isFinite(v)) return String(v);
@@ -1190,11 +1266,18 @@
     return String(v);
   }
 
+  // `Status::Pending` / hashmap entries -> last path segment
+  function enumRustName(v) {
+    var segs = String(v.path).split('::');
+    return segs[segs.length - 1] || v.path;
+  }
+
   function rustDebug(v) {
     if (typeof v === 'string') return '"' + v.replace(/"/g, '\\"') + '"';
     if (v === true || v === false) return String(v);
     if (typeof v === 'object' && v && v.__rust === 'vec') {
-      return '[' + v.items.map(rustDebug).join(', ') + ']';
+      var itemsD = v.items.map(rustDebug).join(', ');
+      return v.type === 'tuple' ? '(' + itemsD + ')' : '[' + itemsD + ']';
     }
     if (typeof v === 'object' && v && v.__rust === 'option') {
       return v.some ? 'Some(' + rustDebug(v.value) + ')' : 'None';
@@ -1202,12 +1285,86 @@
     if (typeof v === 'object' && v && v.__rust === 'result') {
       return (v.ok ? 'Ok(' : 'Err(') + rustDebug(v.value) + ')';
     }
-    if (typeof v === 'object' && v && v.__rust === 'enum') return v.path;
+    if (typeof v === 'object' && v && v.__rust === 'enum') {
+      var base = enumRustName(v);
+      if (v.fields) {
+        var fks = Object.keys(v.fields);
+        if (!fks.length) return base;
+        return base + ' { ' + fks.map(function (k) { return k + ': ' + rustDebug(v.fields[k]); }).join(', ') + ' }';
+      }
+      if (v.args && v.args.length) return base + '(' + v.args.map(rustDebug).join(', ') + ')';
+      return base;
+    }
     if (typeof v === 'object' && v && v.__rust === 'ctor') {
       return v.name + '(' + v.args.map(rustDebug).join(', ') + ')';
     }
+    if (typeof v === 'object' && v && v.__rust === 'struct') {
+      if (typeof v.name === 'string' && typeof v.fields === 'object') {
+        return v.name + ' { ' + Object.keys(v.fields).map(function (k) { return k + ': ' + rustDebug(v.fields[k]); }).join(', ') + ' }';
+      }
+      return rustToString(v);
+    }
+    if (typeof v === 'object' && v && v.__rust === 'hashmap') {
+      return '{' + v.items.map(function (kv) { return rustDebug(kv[0]) + ': ' + rustDebug(kv[1]); }).join(', ') + '}';
+    }
+    if (typeof v === 'object' && v && v.__rust === 'hashset') {
+      return '{' + v.items.map(rustDebug).join(', ') + '}';
+    }
     if (typeof v === 'number') return String(v);
     return rustToString(v);
+  }
+
+  // `{:#?}` pretty debug: composite containers span lines, nested composites
+  // are expanded the same way (rustc pretty-prints recursively).
+  function rustDebugPretty(v, indent) {
+    indent = indent || '';
+    var pad = indent + '    ';
+    if (v !== null && typeof v === 'object' && v.__rust === 'vec') {
+      var isTup = v.type === 'tuple';
+      var open = isTup ? '(' : '[', close = isTup ? ')' : ']';
+      if (!v.items.length) return open + close;
+      return open + '\n' + v.items.map(function (x) { return pad + rustDebugLine(x, pad); }).join(',\n') + ',\n' + indent + close;
+    }
+    if (v !== null && typeof v === 'object' && v.__rust === 'struct' && v.fields) {
+      if (!Object.keys(v.fields).length) return v.name + ' {}';
+      return v.name + ' {\n' +
+        Object.keys(v.fields).map(function (k) { return pad + k + ': ' + rustDebugLine(v.fields[k], pad); }).join(',\n') +
+        ',\n' + indent + '}';
+    }
+    if (v !== null && typeof v === 'object' && v.__rust === 'enum') {
+      var base = enumRustName(v);
+      if (v.fields && Object.keys(v.fields).length) {
+        return base + ' {\n' +
+          Object.keys(v.fields).map(function (k) { return pad + k + ': ' + rustDebugLine(v.fields[k], pad); }).join(',\n') +
+          ',\n' + indent + '}';
+      }
+      if (v.args && v.args.length) return base + '(' + v.args.map(function (x) { return rustDebug(x); }).join(', ') + ')';
+      return base;
+    }
+    if (v !== null && typeof v === 'object' && v.__rust === 'hashmap') {
+      if (!v.items.length) return '{}';
+      return '{\n' + v.items.map(function (kv) { return pad + rustDebug(kv[0]) + ': ' + rustDebugLine(kv[1], pad); }).join(',\n') + ',\n' + indent + '}';
+    }
+    if (v !== null && typeof v === 'object' && v.__rust === 'hashset') {
+      if (!v.items.length) return '{}';
+      return '{\n' + v.items.map(function (x) { return pad + rustDebugLine(x, pad); }).join(',\n') + ',\n' + indent + '}';
+    }
+    if (v !== null && typeof v === 'object' && v.__rust === 'option') {
+      return v.some ? 'Some(' + rustDebug(v.value) + ')' : 'None';
+    }
+    if (v !== null && typeof v === 'object' && v.__rust === 'result') {
+      return (v.ok ? 'Ok(' : 'Err(') + rustDebug(v.value) + ')';
+    }
+    return rustDebug(v);
+  }
+
+  function rustDebugLine(v, pad) {
+    // nested composites get the same pretty treatment
+    if (v !== null && typeof v === 'object' &&
+        (v.__rust === 'vec' || v.__rust === 'struct' || v.__rust === 'hashmap' || v.__rust === 'hashset' || (v.__rust === 'enum' && (v.fields || (v.args && v.args.length))))) {
+      return rustDebugPretty(v, pad);
+    }
+    return rustDebug(v);
   }
 
   function truthy(v) {
@@ -1456,6 +1613,50 @@
         aitems2.push(evalExpr(aparts[ai], env, fns, st).value);
       }
       return { value: { __rust: 'vec', items: aitems2 }, type: 'Vec<_>' };
+    }
+    // enum struct-variant literal: `Status::Pending { timeout: 30 }`
+    // enum tuple-variant ctor:    `Status::Pending(30)` / `Status::Active`
+    if (toks.length >= 3 && toks[1].v === '::') {
+      var pv = 0;
+      while (pv + 2 < toks.length && toks[pv + 1] && toks[pv + 1].v === '::') pv += 2;
+      var lastTok = toks[pv];
+      if (lastTok && lastTok.t === T.IDENT && /^[A-Z]/.test(lastTok.v) && pv + 1 < toks.length) {
+        var afterTok = toks[pv + 1];
+        var fullPath = toks.slice(0, pv + 1).map(function (t) { return t.v; }).join('');
+        if (afterTok && afterTok.v === '{') {
+          var vse = matchTok(toks, pv + 1, '{', '}');
+          if (vse !== -1) {
+            var vfields = {};
+            var vfparts = splitArgs(toks.slice(pv + 2, vse));
+            for (var vfi = 0; vfi < vfparts.length; vfi++) {
+              var vfa = vfparts[vfi];
+              if (!vfa.length) continue;
+              if (vfa.length >= 3 && vfa[0].t === T.IDENT && vfa[1].v === ':') {
+                vfields[vfa[0].v] = evalExpr(vfa.slice(2), env, fns, st).value;
+              } else if (vfa.length === 1 && vfa[0].t === T.IDENT && vfa[0].v !== '_') {
+                var vfv = env[vfa[0].v];
+                vfields[vfa[0].v] = vfv !== undefined ? vfv.value : 0;
+              }
+            }
+            var ev = { __rust: 'enum', path: fullPath, fields: vfields };
+            var evsrest = toks.slice(vse + 1);
+            if (!evsrest.length) return { value: ev, type: fullPath };
+            return finishMethodResult(ev, evsrest, env, fns, st);
+          }
+        }
+        if (afterTok && afterTok.v === '(') {
+          var vce = matchTok(toks, pv + 1, '(', ')');
+          if (vce !== -1) {
+            var vargs = splitArgs(toks.slice(pv + 2, vce))
+              .filter(function (a) { return a.length; })
+              .map(function (a) { return evalExpr(a, env, fns, st).value; });
+            var ev2 = { __rust: 'enum', path: fullPath, args: vargs };
+            var evrest = toks.slice(vce + 1);
+            if (!evrest.length) return { value: ev2, type: fullPath };
+            return finishMethodResult(ev2, evrest, env, fns, st);
+          }
+        }
+      }
     }
     // struct literal: Name { x: 1, y } / Name { x: 1, ..base } -> field map
     if (toks.length >= 3 && toks[0].t === T.IDENT && toks[0].v[0] >= 'A' && toks[0].v[0] <= 'Z' &&
@@ -1927,7 +2128,7 @@
       var hasComma = topIndex(inner10, ',');
       if (hasComma !== -1) {
         var tps = splitArgs(inner10).filter(function (x) { return x.length; });
-        return { value: { __rust: 'vec', items: tps.map(function (x) { return evalExpr(x, env, fns, st).value; }) }, type: 'tuple' };
+        return { value: { __rust: 'vec', type: 'tuple', items: tps.map(function (x) { return evalExpr(x, env, fns, st).value; }) }, type: 'tuple' };
       }
       // `()` unit
       if (!inner10.length) return { value: 0, type: '()' };
@@ -2217,12 +2418,12 @@
   function evalMethod(base, mname, margVals) {
     if (mname === 'to_string' || mname === 'to_owned') return rustToString(base);
     if (mname === 'len') {
-      if (base !== null && typeof base === 'object' && base.__rust === 'vec') return base.items.length;
+      if (base !== null && typeof base === 'object' && (base.__rust === 'vec' || base.__rust === 'hashmap' || base.__rust === 'hashset')) return base.items.length;
       if (typeof base === 'string') return base.length;
       return 0;
     }
     if (mname === 'is_empty') {
-      if (base !== null && typeof base === 'object' && base.__rust === 'vec') return base.items.length === 0;
+      if (base !== null && typeof base === 'object' && (base.__rust === 'vec' || base.__rust === 'hashmap' || base.__rust === 'hashset')) return base.items.length === 0;
       if (typeof base === 'string') return base.length === 0;
       return true;
     }
@@ -2271,8 +2472,36 @@
     }
     if (mname === 'push' && base !== null && typeof base === 'object' && base.__rust === 'vec') { base.items.push(margVals[0]); return base; }
     if (mname === 'insert') {
+      if (base !== null && typeof base === 'object' && base.__rust === 'hashmap') {
+        var k = margVals[0], v = margVals[1];
+        var replaced = false;
+        for (var hmi = 0; hmi < base.items.length; hmi++) {
+          if (String(base.items[hmi][0]) === String(k)) { base.items[hmi][1] = v; replaced = true; break; }
+        }
+        if (!replaced) base.items.push([k, v]);
+        return base;
+      }
+      if (base !== null && typeof base === 'object' && base.__rust === 'hashset') {
+        if (base.items.every(function (x) { return String(x) !== String(margVals[0]); })) base.items.push(margVals[0]);
+        return base;
+      }
       if (base !== null && typeof base === 'object' && base.__rust === 'vec') { base.items.push(margVals.length === 2 ? margVals[1] : margVals[0]); return base; }
       return base;
+    }
+    if (mname === 'contains_key' && base !== null && typeof base === 'object' && base.__rust === 'hashmap') {
+      return base.items.some(function (kv) { return String(kv[0]) === String(margVals[0]); });
+    }
+    if (mname === 'get' && base !== null && typeof base === 'object' && base.__rust === 'hashmap') {
+      var kfg = base.items.find(function (kv) { return String(kv[0]) === String(margVals[0]); });
+      return kfg ? { __rust: 'option', some: true, value: kfg[1] } : { __rust: 'option', some: false };
+    }
+    if (mname === 'remove' && base !== null && typeof base === 'object' && base.__rust === 'hashmap') {
+      base.items = base.items.filter(function (kv) { return String(kv[0]) !== String(margVals[0]); });
+      return base;
+    }
+    if (mname === 'iter' && base !== null && typeof base === 'object' && base.__rust === 'hashmap') {
+      var pairv = { __rust: 'vec', items: base.items.map(function (kv) { return { __rust: 'vec', type: 'tuple', items: [kv[0], kv[1]] }; }), type: 'Vec<_>' };
+      return pairv;
     }
     if (mname === 'send' || mname === 'recv' || mname === 'try_recv') {
       if (mname === 'try_recv') return { __rust: 'result', ok: false, value: 'empty' };
@@ -2430,8 +2659,11 @@
         return { value: { __rust: 'vec', items: [] }, type: 'Vec<_>' };
       }
       if (typeName === 'String') return { value: '', type: 'String' };
-      if (typeName === 'HashMap' || typeName === 'BTreeMap' || typeName === 'HashSet') {
-        return { value: { __rust: 'vec', items: [] }, type: typeName };
+      if (typeName === 'HashMap' || typeName === 'BTreeMap') {
+        return { value: { __rust: 'hashmap', items: [], type: typeName }, type: typeName };
+      }
+      if (typeName === 'HashSet' || typeName === 'BTreeSet') {
+        return { value: { __rust: 'hashset', items: [], type: typeName }, type: typeName };
       }
       // std wrapper types: Cell/Mutex/RwLock/Atomic*/RefCell/OnceLock -> adopt first arg
       var newArgs = splitArgs(argToks).filter(function (a) { return a.length; });
@@ -2742,6 +2974,8 @@
 
   function toItems(v) {
     if (v !== null && typeof v === 'object' && v.__rust === 'vec') return v.items.slice();
+    if (v !== null && typeof v === 'object' && v.__rust === 'hashmap') return v.items.map(function (kv) { return { __rust: 'vec', type: 'tuple', items: [kv[0], kv[1]] }; });
+    if (v !== null && typeof v === 'object' && v.__rust === 'hashset') return v.items.slice();
     if (typeof v === 'number') { var r = []; for (var i = 0; i < v && i < MAX_LOOP; i++) r.push(i); return r; }
     if (typeof v === 'string') return v.split('');
     return [];

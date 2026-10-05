@@ -1,0 +1,20 @@
+{
+  "name": "tower-service",
+  "version": "0.3.3",
+  "crate": "tower-service-0.3.3",
+  "libPath": "/public/frs/du/frs_target/registry/src/tower-service-0.3.3/src/lib.rs",
+  "files": [
+    "src/lib.rs"
+  ],
+  "ok": true,
+  "errCount": 0,
+  "exports": [
+    "Timeout",
+    "fn",
+    "Expired",
+    "TimeoutLayer",
+    "Service"
+  ],
+  "deps": [],
+  "compiledAt": "2026-10-05T20:17:16.167Z"
+}

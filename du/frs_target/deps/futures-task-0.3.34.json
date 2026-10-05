@@ -1,0 +1,39 @@
+{
+  "name": "futures-task",
+  "version": "0.3.34",
+  "crate": "futures-task-0.3.34",
+  "libPath": "/public/frs/du/frs_target/registry/src/futures-task-0.3.34/src/lib.rs",
+  "files": [
+    "src/lib.rs",
+    "src/spawn.rs",
+    "src/arc_wake.rs",
+    "src/waker.rs",
+    "src/waker_ref.rs",
+    "src/future_obj.rs",
+    "src/noop_waker.rs"
+  ],
+  "ok": false,
+  "errCount": 22,
+  "exports": [
+    "SpawnError",
+    "ArcWake",
+    "waker",
+    "WakerRef",
+    "UnsafeFutureObj",
+    "noop_waker",
+    "noop_waker_ref",
+    "Waker",
+    "Wake",
+    "Spawn",
+    "LocalSpawn",
+    "shutdown",
+    "is_shutdown",
+    "new",
+    "new_unowned",
+    "waker_ref",
+    "LocalFutureObj",
+    "FutureObj"
+  ],
+  "deps": [],
+  "compiledAt": "2026-10-05T20:17:16.319Z"
+}

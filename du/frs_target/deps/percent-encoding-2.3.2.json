@@ -1,0 +1,30 @@
+{
+  "name": "percent-encoding",
+  "version": "2.3.2",
+  "crate": "percent-encoding-2.3.2",
+  "libPath": "/public/frs/du/frs_target/registry/src/percent-encoding-2.3.2/src/lib.rs",
+  "files": [
+    "src/lib.rs",
+    "src/ascii_set.rs"
+  ],
+  "ok": false,
+  "errCount": 42,
+  "exports": [
+    "percent_encode_byte",
+    "percent_encode",
+    "utf8_percent_encode",
+    "PercentEncode",
+    "percent_decode_str",
+    "percent_decode",
+    "PercentDecode",
+    "decode_utf8",
+    "decode_utf8_lossy",
+    "NON_ALPHANUMERIC",
+    "AsciiSet",
+    "EMPTY",
+    "fn",
+    "CONTROLS"
+  ],
+  "deps": [],
+  "compiledAt": "2026-10-05T20:17:16.909Z"
+}

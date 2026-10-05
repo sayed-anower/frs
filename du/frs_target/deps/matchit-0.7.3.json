@@ -1,0 +1,35 @@
+{
+  "name": "matchit",
+  "version": "0.7.3",
+  "crate": "matchit-0.7.3",
+  "libPath": "/public/frs/du/frs_target/registry/src/matchit-0.7.3/src/lib.rs",
+  "files": [
+    "src/lib.rs",
+    "src/error.rs",
+    "src/params.rs",
+    "src/router.rs",
+    "src/tree.rs"
+  ],
+  "ok": false,
+  "errCount": 61,
+  "exports": [
+    "MatchError",
+    "ParamsIter",
+    "Router",
+    "InsertError",
+    "Params",
+    "len",
+    "get",
+    "iter",
+    "is_empty",
+    "new",
+    "insert",
+    "at",
+    "at_mut",
+    "check_priorities",
+    "Match",
+    "Node"
+  ],
+  "deps": [],
+  "compiledAt": "2026-10-05T20:17:16.528Z"
+}

@@ -99,6 +99,12 @@
       name: 'struct-literal-needs-brace',
       desc: 'Struct literal `Name { ... }` needs `{`.',
       check: function (ctx) { return null; } // placeholder: keep table extensible
+    },
+    {
+      id: 'R023', code: null, level: 'error', anchor: 'eof',
+      name: 'missing-semi-after-call',
+      desc: 'Call/macro statements must be terminated with `;`.',
+      check: function (ctx) { return ctx.checkMissingSemiExprStmt(); }
     }
   ];
 
@@ -304,6 +310,69 @@
       }
       return null;
     };
+
+    // A call/macro statement must end with `;` when it sits between two
+    // other statements. The core pass tracks `ctx.calls` (plain IDENT(...))
+    // and `ctx.macros` (name!(...)); inspect the opening token's previous
+    // neighbor: `{`, `;`, `}`/end-of-previous-decl all qualify as
+    // statement position. Then the token right after the call's/macro's
+    // closing `)` must be `;` — unless it is a continuation (`.`,`?`,`::`,
+    // binary op, `as`), or another arg position (`,`), or the block ends
+    // (`}` after a tail expression is valid).
+    ctx.checkMissingSemiExprStmt = function () {
+      var toks = ctx.toks, n = toks.length, out = [];
+      var seenLine = {};
+      function scanEnd(node, isCall) {
+        var endIdx = node.endIdx;
+        if (endIdx === -1 || endIdx === undefined || endIdx >= n) return;
+        var nx = toks[endIdx + 1];
+        if (!nx) return;
+        if (nx.v === ';' || nx.v === ',' || nx.v === '?' || nx.v === 'as') return;
+        if (nx.v === '.' || nx.v === '::') return;
+        // binary-op continuation
+        {
+          var op = nx.v;
+          if (op === '+' || op === '-' || op === '*' || op === '/' || op === '%' ||
+              op === '==' || op === '!=' || op === '<' || op === '>' || op === '<=' ||
+              op === '>=' || op === '&&' || op === '||' || op === '=>') return;
+        }
+        // macro invocation or fn call used as a value: prev token is `=`/`(`/`,`/`=>`/`:`
+        var idx = node.idx;
+        if (isCall ? toks[idx - 1] === undefined : false) return;
+        var prev = idx > 0 ? toks[idx - 1] : null;
+        if (!prev) return;
+        var statementStart = prev.v === '{' || prev.v === ';' ||
+          (prev.t === T.IDENT && (prev.v === 'fn' || prev.v === 'else'));
+        if (!statementStart) return;
+        // tail position of a block: next token is the block's '}'.
+        // (A fn/macro tail call needs no `;` when it returns ().)
+        if (nx.v === '}') return;
+        if (nx.line === toks[endIdx].line) return; // same line continuation that core missed
+        var key = node.idx + '_' + endIdx;
+        if (seenLine[key]) return;
+        seenLine[key] = 1;
+        out.push({ msg: 'expected `;` after expression', line: toks[endIdx].line, col: toks[endIdx].col + 1, spanLen: 1, hint: 'add `;` here' });
+      }
+      for (var ci = 0; ci < ctx.calls.length; ci++) scanEnd(ctx.calls[ci], true);
+      for (var mi = 0; mi < ctx.macros.length; mi++) scanEnd(ctx.macros[mi], false);
+      return out.length ? out : null;
+    };
+
+    // Heuristic: does the block containing the call DIRECTLY end at nx?
+    // i.e. no more tokens until a closing '}' at one depth below the call.
+    function tokLooksLikeTail(idx, endIdx) {
+      var toks = ctx.toks;
+      var d = 0;
+      for (var i = idx; i <= endIdx + 1 && i < toks.length; i++) {
+        var w = toks[i].v;
+        if (w === '{' || w === '(' || w === '[') d++;
+        else if (w === '}' || w === ')' || w === ']') {
+          d--;
+          if (d <= 0) return i === endIdx + 1;
+        }
+      }
+      return false;
+    }
 
     ctx.checkArrowType = function () {
       var st7 = ctx.current;

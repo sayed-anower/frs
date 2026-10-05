@@ -1,6 +1,5 @@
 /* frs/src/checker.js — fast single-pass syntax+type checker (core engine).
  * Rule tables + implementations live in src/rules/*.js (see src/rules/index.js).
- * Pure JS, no deps.
  */
 (function (root, factory) {
   if (typeof module !== 'undefined' && module.exports) {
@@ -114,7 +113,21 @@
           if (seg[qq].v === '{') { ob = qq; break; }
         }
         if (ob !== -1) {
-          // tokens before `{` are the prefix path (ignored; leaf names matter)
+          // tokens before `{` are the prefix path: register the path segment
+          // immediately before the `{` (e.g. `io` in `use std::io::{..}`) as
+          // a binding, so `io::stdin()` resolves through std. Also expands
+          // `self::{...}` groups correctly.
+          if (!localsPrefixOk) var localsPrefixOk = null;
+          var pregTok = null;
+          for (var zx = ob - 1; zx > 0; zx--) {
+            if (seg[zx].t === T.IDENT && seg[zx].v !== 'as') { pregTok = seg[zx].v; break; }
+            if (seg[zx].v === '::') continue;
+            if (seg[zx].t === T.IDENT && seg[zx].v === 'as') continue;
+            break;
+          }
+          if (pregTok && pregTok !== 'std' && pregTok !== 'core' && pregTok !== 'alloc' && !isKw(pregTok)) {
+            extraBindings.push({ name: pregTok, idx: lo, lo: lo, hi: hi, src: 'use' });
+          }
           var closeI = seg.length - 1;
           while (closeI >= 0 && seg[closeI].v !== '}') closeI--;
           bindUseTree(seg.slice(ob + 1, closeI), lo, hi);

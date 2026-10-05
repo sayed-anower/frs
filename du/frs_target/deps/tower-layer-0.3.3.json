@@ -1,0 +1,27 @@
+{
+  "name": "tower-layer",
+  "version": "0.3.3",
+  "crate": "tower-layer-0.3.3",
+  "libPath": "/public/frs/du/frs_target/registry/src/tower-layer-0.3.3/src/lib.rs",
+  "files": [
+    "src/lib.rs",
+    "src/identity.rs",
+    "src/layer_fn.rs",
+    "src/stack.rs",
+    "src/tuple.rs"
+  ],
+  "ok": false,
+  "errCount": 22,
+  "exports": [
+    "LogLayer",
+    "LogService",
+    "Layer",
+    "Stack",
+    "Identity",
+    "fn",
+    "layer_fn",
+    "LayerFn"
+  ],
+  "deps": [],
+  "compiledAt": "2026-10-05T20:17:16.141Z"
+}

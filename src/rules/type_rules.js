@@ -75,12 +75,61 @@
       name: 'unknown-crate',
       desc: '`use foo::...` where `foo` is not a dependency (project mode only).',
       check: function (ctx) { return ctx.checkUnknownCrate(); }
+    },
+    {
+      id: 'T019', code: 'E0433', level: 'error', anchor: 'eof',
+      name: 'unknown-std-module',
+      desc: '`use std::not_real::..` — segment must be a real std module.',
+      check: function (ctx) { return ctx.checkRealStdSubmodules(); }
+    },
+    {
+      id: 'T020', code: 'E0433', level: 'error', anchor: 'call',
+      name: 'unknown-path-root',
+      desc: 'Path call `Foo::bar()` with an unresolvable leading name.',
+      check: function (ctx) { return ctx.checkPathCallRoot(); }
+    },
+    {
+      id: 'T021', code: 'E0080', level: 'error', anchor: 'decl',
+      name: 'literal-out-of-range',
+      desc: 'Integer literal does not fit the annotated type.',
+      check: function (ctx) { return ctx.checkLiteralRange(); }
+    },
+    {
+      id: 'T022', code: 'E0412', level: 'error', anchor: 'stmt',
+      name: 'bad-fn-type',
+      desc: 'fn parameter/return types must be known types.',
+      check: function (ctx) { return ctx.checkFnTypes(); }
+    },
+    {
+      id: 'T023', code: 'E0599', level: 'error', anchor: 'call',
+      name: 'unknown-array-method',
+      desc: 'Arrays are not growable: `push`/`pop`/... do not exist.',
+      check: function (ctx) { return ctx.checkArrayMethod(); }
+    },
+    {
+      id: 'T024', code: 'E0277', level: 'error', anchor: 'macro',
+      name: 'display-trait',
+      desc: '`{}` requires Display; Vec/Option/Result/struct/enum types need `{:?}`.',
+      check: function (ctx) { return ctx.checkDisplayFormat(); }
+    },
+    {
+      id: 'T025', code: null, level: 'error', anchor: 'eof',
+      name: 'format-spec',
+      desc: 'Format placeholder must be valid `{...}` syntax.',
+      check: function (ctx) { return ctx.checkFormatPlaceholders(); }
+    },
+    {
+      id: 'T026', code: null, level: 'error', anchor: 'eof',
+      name: 'struct-shape',
+      desc: 'Struct defs + literals: no dup fields, known fields, known types, valid separators.',
+      check: function (ctx) { return ctx.checkStructDefsLiterals(); }
     }
   ];
 
   function attachTypes(ctx, shared) {
     shared = shared || {};
     var isKw = shared.isKw || function () { return false; };
+    var T = shared.T || { IDENT: 1 };
     var PRINT_LIKE = shared.PRINT_LIKE || {};
     var KNOWN_TYPES = shared.KNOWN_TYPES || {};
     var KNOWN_MACROS = shared.KNOWN_MACROS || {};
@@ -115,6 +164,63 @@
       ctx.__methodInfer = 1;
       var __origInfer = ctx.infer;
       ctx.infer = function (valToks, byName, useIdx, structs) {
+        // struct-literal / enum literal root: `User { .. }`, `Status::Pending { .. }`
+        if (valToks && valToks.length >= 2 && valToks[0].t === T.IDENT &&
+            /^[A-Z]/.test(valToks[0].v) && valToks[1].v === '{') {
+          return valToks[0].v;
+        }
+        if (valToks && valToks.length >= 4 && valToks[0].t === T.IDENT &&
+            /^[A-Z]/.test(valToks[0].v) && valToks[1].v === '::' &&
+            valToks[2] && /^[A-Z]/.test(valToks[2].v) && valToks[3].v === '{') {
+          return valToks[0].v;
+        }
+        // bare parenthesized tuple literal is non-Display
+        if (valToks && valToks.length >= 3 && valToks[0].v === '(') {
+          var hasComma = false, dbp = 0;
+          for (var tu = 0; tu < valToks.length; tu++) {
+            var wv = valToks[tu].v;
+            if (valToks[tu].v === ',' && dbp === 1) { hasComma = true; break; }
+            if (wv === '(' || wv === '[' || wv === '{') dbp++;
+            else if (wv === ')' || wv === ']' || wv === '}') dbp--;
+          }
+          if (hasComma) return 'tuple';
+        }
+        // single ident that is a binding registered with an annotated type or
+        // a struct-literal value
+        if (valToks && valToks.length === 1 && valToks[0].t === T.IDENT && byName) {
+          var candarr = byName[valToks[0].v];
+          if (candarr) {
+            var cand = null;
+            for (var cb = 0; cb < candarr.length; cb++) {
+              var bb = candarr[cb];
+              if (bb.kind === 'let' && (!cand || bb.idx > cand.idx) && (bb.ann || (bb.valToks && bb.valToks.length))) cand = bb;
+            }
+            if (cand) {
+              if (cand.ann) return normType(cand.ann);
+              if (cand.valToks && cand.valToks.length) {
+                var v0 = cand.valToks[0];
+                if (v0.t === T.IDENT && /^[A-Z]/.test(v0.v)) {
+                  if (cand.valToks[1] && cand.valToks[1].v === '{') return v0.v;
+                  if (cand.valToks[1] && cand.valToks[1].v === '::' && cand.valToks[2] && /^[A-Z]/.test(cand.valToks[2].v) && cand.valToks[3] && cand.valToks[3].v === '{') return v0.v;
+                }
+                if (v0.t === T.IDENT && cand.valToks[1] && cand.valToks[1].v === '!') {
+                  if (v0.v === 'vec') return 'Vec<_>';
+                  if (v0.v === 'format') return 'String';
+                }
+                if (v0.v === '(') {
+                  var dbl = 0, seeComma = false;
+                  for (var tj = 0; tj < cand.valToks.length; tj++) {
+                    var wvn = cand.valToks[tj].v;
+                    if (wvn === '(' || wvn === '[' || wvn === '{') dbl++;
+                    else if (wvn === ')' || wvn === ']' || wvn === '}') dbl--;
+                    if (wvn === ',' && dbl === 1) { seeComma = true; break; }
+                  }
+                  if (seeComma) return 'tuple';
+                }
+              }
+            }
+          }
+        }
         var mt = methodChainType(valToks);
         if (mt !== null) return mt;
         return __origInfer(valToks, byName, useIdx, structs);
@@ -438,6 +544,538 @@
       }
       return null;
     };
+
+    // ---- T019-T026: structural validation (prompt.txt parity) ----
+    var STD_MOD_OK = {};
+    (function () {
+      var m = [
+        'any', 'arch', 'borrow', 'boxed', 'cell', 'char', 'cmp', 'collections',
+        'convert', 'default', 'env', 'error', 'ffi', 'fmt', 'fs', 'future',
+        'hash', 'hint', 'io', 'iter', 'marker', 'mem', 'net', 'num', 'ops',
+        'option', 'os', 'panic', 'path', 'pin', 'prelude', 'process', 'ptr',
+        'raw', 'rc', 'result', 'slice', 'str', 'string', 'sync', 'task',
+        'thread', 'time', 'vec', 'rt', 'alloc', 'test', 'fixed_sizeffi'
+      ];
+      for (var i = 0; i < m.length; i++) STD_MOD_OK[m[i]] = 1;
+    })();
+    var PRELUDE_TYPE_OK = { String: 1, Vec: 1, Option: 1, Result: 1, Box: 1 };
+
+    function collectFullPath(tokens, startIdx) {
+      // tokens[startIdx] is Call name;  walk back by '::', collect path entries
+      var i = startIdx, seg = [tokens[i].v];
+      while (i - 2 >= 0 && tokens[i - 1].v === '::') {
+        seg.unshift(tokens[i - 2].v);
+        i -= 2;
+      }
+      return seg;
+    }
+
+    ctx.checkPathCallRoot = function () {
+      var cn = ctx.current;
+      if (!cn || cn.kind !== 'call' || !cn.isPath) return null;
+      if (ctx.isCfgGatedOut && ctx.isCfgGatedOut(cn.line, cn.col)) return null;
+      var toks = ctx.toks;
+      // collect the full path by walking backward from the call name
+      var idx = cn.idx, seg = [toks[idx].v];
+      while (idx - 2 >= 0 && toks[idx - 1].v === '::' && toks[idx - 2].t === T.IDENT) {
+        seg.unshift(toks[idx - 2].v);
+        idx -= 2;
+      }
+      if (!seg.length) return null;
+      var root = seg[0];
+      // Path roots are valid when they resolve: std-prefixed paths get the
+      // segment after `std` checked against the real std module list;
+      // identifiers must be an org-known type/module/mod/lib alias or a
+      // user struct/enum/trait/whatever the compiler knows from this file.
+      if (root === 'std' || root === 'core' || root === 'alloc' || root === 'crate' || root === 'self' || root === 'super') {
+        if (seg[1] !== undefined && (root === 'std' || root === 'core' || root === 'alloc') && !STD_MOD_OK[seg[1]]) {
+          var wrong = seg[1];
+          return { msg: 'unresolved import `' + root + '::' + wrong + '`', line: cn.line, col: cn.col, spanLen: wrong.length, hint: 'check the std path', _code: 'E0433' };
+        }
+        return null;
+      }
+      if (ctx.modNames[root]) return null;
+      var arr = ctx.byName[root];
+      if (arr !== undefined && arr !== null) return null;
+      if (ctx.structs.hasOwnProperty(root)) return null;
+      // Likely third-party crate names used single-file (`dioxus::...`): if
+      // no extern list is configured, trust these are provided (frs
+      // synthesizes GUI/std support) — lowercase roots are also almost
+      // certainly imports or generics.
+      if (!ctx.externs) return null;
+      var asRoot = firstCharacterUpper(root);
+      if (asRoot && (PRELUDE_TYPE_OK[root] || KNOWN_TYPES.hasOwnProperty(root))) return null;
+      return {
+        msg: 'unresolved import: cannot find `' + root + '` in this scope',
+        line: cn.line, col: cn.col, spanLen: root.length,
+        _code: 'E0432', hint: 'import the crate or declare the type first'
+      };
+
+      function firstCharacterUpper(name) {
+        return name && name.length && name.charAt(0) >= 'A' && name.charAt(0) <= 'Z';
+      }
+    };
+
+    ctx.checkRealStdSubmodules = function () {
+      var toks = ctx.toks, n = toks.length, out = [], i = 0;
+      while (i < n - 3) {
+        if (toks[i].t === T.IDENT && toks[i].v === 'use' && toks[i + 1].t === T.IDENT &&
+            (toks[i + 1].v === 'std' || toks[i + 1].v === 'core' || toks[i + 1].v === 'alloc') &&
+            toks[i + 2].v === '::' && toks[i + 3].t === T.IDENT) {
+          var sub = toks[i + 3].v;
+          if (toks[i + 3].v !== '{' && !STD_MOD_OK[sub] && !ctx.modNames[sub]) {
+            // check modNames / externs decl says ok
+            if (!ctx.modNames[sub]) {
+              out.push({ msg: 'unresolved import `use ' + toks[i + 1].v + '::' + sub + '`', line: toks[i + 3].line, col: toks[i + 3].col, spanLen: sub.length, hint: '`' + sub + '` is not a std module', _code: 'E0433' });
+            }
+          }
+        }
+        i++;
+      }
+      return out.length ? out : null;
+    };
+
+    var INT_RANGE = {
+      i8: [-128, 127], i16: [-32768, 32767], i32: [-2147483648, 2147483647],
+      u8: [0, 255], u16: [0, 65535], u32: [0, 4294967295]
+    };
+    ctx.checkLiteralRange = function () {
+      var d = ctx.current;
+      if (!d || d.kind !== 'let' || !d.ann) return null;
+      if (ctx.isCfgGatedOut && ctx.isCfgGatedOut(d.nameLine, d.nameCol)) return null;
+      var r = INT_RANGE[String(d.ann)];
+      if (!r) return null;
+      var v0 = d.valToks && d.valToks[0];
+      if (!v0) return null;
+      var numTok = v0.t === T.NUMBER ? v0 : (d.valToks.length >= 2 && d.valToks[0].v === '-' && d.valToks[1].t === T.NUMBER ? d.valToks[1] : null);
+      if (!numTok) return null;
+      var s = numTok.v.replace(/_/g, '').toLowerCase().replace(/(i8|i16|i32|i64|i128|isize|u8|u16|u32|u64|u128|usize)$/, '');
+      var val = parseFloat(s);
+      if (isNaN(val)) return null;
+      if (d.valToks[0].v === '-') val = -val;
+      if (val < r[0] || val > r[1]) {
+        return { msg: 'literal out of range for `' + d.ann + '`', line: numTok.line, col: numTok.col, spanLen: numTok.v.length, _code: 'E0080' };
+      }
+      return null;
+    };
+
+    ctx.checkFnTypes = function () {
+      var fNode = ctx.current;
+      if (!fNode || fNode.kind !== 'fn') return null;
+      if (ctx.isCfgGatedOut && ctx.isCfgGatedOut(fNode.line, fNode.col)) return null;
+      var out = [];
+      // all declared types in the signature: params + ret
+      function validateTypeStr(a2, tkTok) {
+        if (!a2) return null;
+        a2 = String(a2).replace(/\s+/g, '');
+        if (a2.charAt(0) === '!' || a2.indexOf(',') >= 0 || a2.charAt(0) === '(' || a2.charAt(0) === '[') return null;
+        var firstToken = a2.match(/^(?:\&?(?:mut|&'\w+)?)?([A-Za-z_][A-Za-z0-9_]*)?/);
+        if (!firstToken || !firstToken[1]) return null;
+        var first = firstToken[1];
+        if (first === 'dyn' || first === 'impl' || first === 'Self' || first === 'self' || first === '_' || first === '!') return null;
+        if (KNOWN_TYPES.hasOwnProperty(first) || ctx.structs.hasOwnProperty(first)) return null;
+        // single capital letter is always canonical generic param (S, T, F, A)
+        if (first.length === 1 && first >= 'A' && first <= 'Z') return null;
+        if (/^[a-z]/.test(first)) return null; // mod-qualified paths / trait names skip
+        return { msg: 'cannot find type `' + first + '` in this scope', line: tkTok.line, col: tkTok.col, spanLen: first.length, _code: 'E0412' };
+      }
+      if (fNode.ret) {
+        var rd = validateTypeStr(fNode.ret, fNode);
+        if (rd) out.push(rd);
+      }
+      // tail-expression type check on the declared return type when the
+      // body's visible tail expression carries one.
+      if (fNode.ret && fNode.bodyOpen !== -1 && ctx.toks && ctx.toks.length > fNode.bodyOpen + 1) {
+        var tail = fnTailToks(ctx.toks, fNode.bodyOpen);
+        if (tail && tail.length) {
+          var inf = ctx.infer(tail, ctx.byName, fNode.idx, ctx.structs);
+          if (inf && inf !== 'unknown' && !ctx.compat(fNode.ret, inf)) {
+            out.push({ msg: 'mismatched types', line: tail[0].line, col: tail[0].col, spanLen: 3, label: 'expected `' + fNode.ret + '`, found `' + inf + '`', _code: 'E0308' });
+          }
+        }
+      }
+      return out.length ? out : null;
+    };
+
+    // Tokens of the fn body's trailing expression: everything after the
+    // last top-level `;` inside the fn body braces, up to the close brace.
+    function fnTailToks(toks, bodyOpen) {
+      var close = matchCloseOf('{');
+      function matchCloseOf(openCh) { return matchCh(toks, bodyOpen, openCh, '}'); }
+      if (close === -1 || close <= bodyOpen + 1) return null;
+      var d = 0, lastSemi = -1;
+      for (var i = bodyOpen + 1; i < close; i++) {
+        var v = toks[i].v;
+        if (v === '(' || v === '[' || v === '{') d++;
+        else if (v === ')' || v === ']' || v === '}') d--;
+        else if (v === ';' && d === 0) lastSemi = i;
+      }
+      var tail = []; for (var tt2 = lastSemi === -1 ? bodyOpen + 1 : lastSemi + 1; tt2 < close; tt2++) tail.push(toks[tt2]);
+      // tail beginning with stmt braces (`loop`/`if`/`match`/`for`) is not a scalar value
+      var STATE_TAILS = { loop: 1, if: 1, match: 1, for: 1, while: 1, unsafe: 1, fn: 1 };
+      if (tail.length && tail[0].t === T.IDENT && STATE_TAILS[tail[0].v]) return null;
+      return tail;
+    }
+    function matchCh(toks, from, open, close) { var d = 0; for (var i = from; i < toks.length; i++) { if (toks[i].v === open) d++; else if (toks[i].v === close) { d--; if (d === 0) return i; } } return -1; }
+    function sliceTop(toks, lo, hi) {
+      var out = [];
+      for (var i = lo; i < hi; i++) out.push(toks[i]);
+      return out;
+    }
+
+    ctx.checkArrayMethod = function () {
+      var cn = ctx.current;
+      if (!cn || cn.kind !== 'call' || !cn.isMethod) return null;
+      var resizableMethods = { push: 1, pop: 1, insert: 1, remove: 1, append: 1, clear: 1, extend: 1, reserve: 1, truncate: 1, swap_remove: 1, split_off: 1, leak: 1 };
+      if (!resizableMethods[cn.name]) return null;
+      if (!cn.base) return null;
+      var b = cn.base;
+      if (cn.base.indexOf('.') > -1) return null;
+      var binding = ctx.bindingFor(b, cn.idx);
+      if (!binding || !binding.valToks || !binding.valToks.length) return null;
+      var first = binding.valToks[0];
+      if (first && first.v === '[' && binding.valToks[1] && binding.valToks[1].v !== ';' && binding.valToks[0].v === '[') {
+        // `let a = [...]; a.push(4)` — arrays not growable
+        return { msg: 'no `' + cn.name + '` on arrays: arrays have fixed size', line: cn.line, col: cn.col, spanLen: cn.name.length, _code: 'E0599', hint: 'use `Vec::...` from std::vec::Vec' };
+      }
+      if (first && first.v === '[' && binding.valToks.length >= 2) {
+        return { msg: 'no such method `' + cn.name + '` on array', line: cn.line, col: cn.col, spanLen: cn.name.length, _code: 'E0599' };
+      }
+      return null;
+    };
+
+    var NON_DISPLAY_LIKE = { Vec: 1, Option: 1, Result: 1, HashMap: 1, HashSet: 1, BTreeMap: 1, BTreeSet: 1, VecDeque: 1, LinkedList: 1, BinaryHeap: 1, tuple: 1, vec: 1, void: 1 };
+    function argsOfMacro(m) {
+      var toks = ctx.toks;
+      var parts = [];
+      var depth = 0, cur = [];
+      var seenOpen = false;
+      for (var i = m.idx; i <= m.endIdx; i++) {
+        var v = toks[i].v;
+        if (v === '(' || v === '[' || v === '{') { depth++; seenOpen = true; }
+        else if (v === ')' || v === ']' || v === '}') { depth--; }
+        if (seenOpen && depth === 1 && v === ',') { parts.push(cur); cur = []; continue; }
+        if (seenOpen && depth >= 1) cur.push(toks[i]);
+      }
+      if (cur.length) parts.push(cur);
+      return parts;
+    }
+
+    ctx.checkDisplayFormat = function () {
+      var m = ctx.current;
+      if (!m || m.kind !== 'macro' || !PRINT_LIKE[m.name] || m.fmtStr === null) return null;
+      if (ctx.isCfgGatedOut && ctx.isCfgGatedOut(m.line, m.col)) return null;
+      // placeholder list in fmtStr
+      var fmtStr = null;
+      var args = argsOfMacro(m);
+      if (args.length) {
+        var firstArgToks = args[0];
+        for (var kwi = 0; kwi < firstArgToks.length; kwi++) {
+          if (firstArgToks[kwi].t === T.STRING || firstArgToks[kwi].t === T.RAWSTR) {
+            fmtStr = String(firstArgToks[kwi].v);
+            break;
+          }
+        }
+      }
+      if (!fmtStr) return null;
+      // walk the format string and inspect placeholders
+      var argsAfterFmt = args.slice(1);
+      var pi = 0, err = null, k = 0, inStr = fmtStr.charAt(0) === 'r';
+      var s = fmtStr;
+      if (inStr) { var q = s.indexOf('"'); s = s.slice(q); }
+      if (s.charAt(0) === '"') s = s.slice(1, s.lastIndexOf('"'));
+      if (!s) return null;
+      while (k < s.length) {
+        var c2 = s[k];
+        if (c2 === '{' && s[k + 1] === '{') { k += 2; continue; }
+        if (c2 === '}' && s[k + 1] === '}') { k += 2; continue; }
+        if (c2 === '{') {
+          var e = s.indexOf('}', k);
+          if (e === -1) return null;
+          var inside = s.slice(k + 1, e);
+          var spec = '';
+          var nm = inside;
+          var ci = inside.indexOf(':');
+          if (ci !== -1) { nm = inside.slice(0, ci); spec = inside.slice(ci + 1); }
+          var argToks = null;
+          if (nm === '' || (nm[0] >= '0' && nm[0] <= '9')) {
+            var idxA = nm === '' ? pi++ : parseInt(nm, 10);
+            if (idxA >= 0 && idxA < argsAfterFmt.length) argToks = argsAfterFmt[idxA];
+          } else {
+            var aToks = null;
+            for (var a2i = 0; a2i < argsAfterFmt.length; a2i++) {
+              var tks2 = argsAfterFmt[a2i];
+              if (tks2.length >= 3 && tks2[0].t === T.IDENT && tks2[0].v === nm && tks2[1].v === '=') { aToks = tks2.slice(2); break; }
+            }
+            if (aToks === null && ctx.byName[nm] !== undefined) {
+              var binding = ctx.byName[nm];
+              if (binding && binding.length) {
+                // byName: most recent let with matching name
+                var cand = null;
+                for (var bi2 = 0; bi2 < binding.length; bi2++) {
+                  var bb = binding[bi2];
+                  if (bb.kind === 'let' && (!cand || bb.idx > cand.idx)) cand = bb;
+                }
+                if (cand) inferTypeAndCheckDisplay(cand.valToks, nm, spec);
+              }
+            } else if (aToks) inferTypeAndCheckDisplay(aToks, nm, spec);
+          }
+          if (argToks !== null && spec.indexOf('?') === -1) {
+            inferTypeAndCheckDisplay(argToks, '?', spec);
+          }
+          k = e + 1; continue;
+        }
+        k++;
+      }
+      return err;
+
+      function inferTypeAndCheckDisplay(argToks, nmLabel, spec) {
+        if (!argToks || !argToks.length) return;
+        var inf = ctx.infer(argToks, ctx.byName, m.idx, ctx.structs);
+        if (!inf || inf === 'unknown') return;
+        var base = inf.split('<')[0].split('(')[0].replace(/^&+/, '').replace(/^mut /, '').replace(/ /g, '');
+        if (!base || (KNOWN_TYPES.hasOwnProperty(base) && !NON_DISPLAY_LIKE[base])) return;
+        if (base === '()' || base === 'char' || base === '!' || base === '_' ) return;
+        var nonDisplay = NON_DISPLAY_LIKE[base] || ctx.structs.hasOwnProperty(base);
+        if (nonDisplay && spec.indexOf('?') === -1) {
+          err = err || { msg: 'the trait `Display` is not implemented for `' + base + '`', line: m.line, col: m.col, spanLen: m.name.length + 1, hint: 'use `{:?}` (Debug) instead', _code: 'E0277' };
+        }
+      }
+    };
+
+    // placeholder name validation: no syntactically-invalid placeholder names
+    var PLACEHOLDER_OK = /^(\d*|[a-zA-Z_][a-zA-Z0-9_]*)?(:[^{()}\[\], ]*)?$/;
+    ctx.checkFormatPlaceholders = function () {
+      var out = [];
+      for (var mi = 0; mi < ctx.macros.length; mi++) {
+        var m = ctx.macros[mi];
+        if (!PRINT_LIKE[m.name] || m.fmtStr === null) continue;
+        if (ctx.isCfgGatedOut && ctx.isCfgGatedOut(m.line, m.col)) continue;
+        var args = argsOfMacro(m);
+        if (!args.length) continue;
+        var fmtStr = null;
+        for (var kwi = 0; kwi < args[0].length; kwi++) {
+          if (args[0][kwi].t === T.STRING || args[0][kwi].t === T.RAWSTR) { fmtStr = String(args[0][kwi].v); break; }
+        }
+        if (!fmtStr) continue;
+        var s = fmtStr;
+        if (s.charAt(0) === 'r') s = s.slice(s.indexOf('"'));
+        if (s.charAt(0) === '"') s = s.slice(1, s.lastIndexOf('"'));
+        var k = 0, inStr = s;
+        while (k < inStr.length) {
+          var c2 = inStr[k];
+          if (c2 === '{' && inStr[k + 1] === '{') { k += 2; continue; }
+          if (c2 === '}' && inStr[k + 1] === '}') { k += 2; continue; }
+          if (c2 === '{') {
+            var e = inStr.indexOf('}', k);
+            if (e === -1) break;
+            var inside = inStr.slice(k + 1, e);
+            if (!PLACEHOLDER_OK.test(inside)) {
+              out.push({ msg: 'invalid format string: `{' + inside + '}`', line: m.line, col: m.col + 1, spanLen: inside.length, _code: null, hint: 'use `{}`/`{name}`/`{0}` + optional `:spec`' });
+            }
+            k = e + 1; continue;
+          }
+          k++;
+        }
+      }
+      return out.length ? out : null;
+    };
+
+    // ---- structural: struct/enum definition + literal-shape checks ----
+    ctx.checkStructDefsLiterals = function () {
+      var toks = ctx.toks, n = toks.length, out = [];
+      var defs = {};
+      var i = 0;
+      while (i < n) {
+        if (toks[i].t === T.IDENT && (toks[i].v === 'struct' || toks[i].v === 'enum')) {
+          var isEnum = toks[i].v === 'enum';
+          var nx = i + 1;
+          if (nx < n && toks[nx].t === T.IDENT) {
+            var name = toks[nx].v, kx = nx + 1;
+            // skip generics <T, ...>
+            if (kx < n && toks[kx].v === '<') {
+              var dd = 0;
+              while (kx < n) {
+                if (toks[kx].v === '<') dd++;
+                else if (toks[kx].v === '>>') { dd -= 2; if (dd <= 0) { kx++; break; } }
+                else if (toks[kx].v === '>') { dd--; if (dd === 0) { kx++; break; } }
+                kx++;
+              }
+            }
+            if (kx < n && toks[kx].v === '{') {
+              var closeK = findMatchTok(kx, '{', '}');
+              if (closeK !== -1) {
+                var def = parseStructBodyItems(toks, kx + 1, closeK, isEnum, toks[i]);
+                if (defs[name]) {
+                  out.push({ msg: 'the name `' + name + '` is defined multiple times', line: toks[i].line, col: toks[i].col, spanLen: name.length, _code: 'E0428' });
+                }
+                if (!defs[name]) defs[name] = { name: name, fields: def.entries, enum: isEnum, line: toks[i].line, col: toks[i].col };
+                // separator + duplication validation on raw items
+                var items = def.rawItems;
+                var seen = {};
+                for (var ii = 0; ii < items.length; ii++) {
+                  var itm = items[ii];
+                  if (itm === ';') {
+                    out.push({ msg: 'expected `,`, found `;`', line: toks[i].line, col: toks[i].col, spanLen: 1, hint: 'use commas between fields' });
+                    break;
+                  }
+                  if (!itm.name) continue;
+                  if (seen[itm.name]) {
+                    out.push({ msg: 'duplicate field/variant `' + itm.name + '`', line: itm.line, col: itm.col, spanLen: itm.name.length, _code: 'E0428' });
+                  }
+                  seen[itm.name] = 1;
+                  if (itm.fieldType) {
+                    var fFirst = itm.fieldType;
+                    if (!knownStructuralTypeName(fFirst)) {
+                      out.push({ msg: 'cannot find type `' + fFirst + '` in this scope', line: itm.line, col: itm.col, spanLen: fFirst.length, _code: 'E0412' });
+                    }
+                  }
+                }
+              }
+            }
+          }
+          i++; continue;
+        }
+        i++;
+      }
+
+      // struct literals: scan IDENT { at positions we consider expressions
+      var isKwTypeCtx = shared.isKw || function () { return false; };
+      var KEYWORD_PREVS = { struct: 1, enum: 1, trait: 1, impl: 1, union: 1, fn: 1, type: 1, const: 1, static: 1, let: 1, for: 1, while: 1, if: 1, match: 1, else: 1, extern: 1, mod: 1, use: 1, as: 1, dyn: 1, unsafe: 1, return: 1, pub: 1, ref: 1, mut: 1, where: 1, in: 1 };
+      for (var i2 = 0; i2 < n - 1; i2++) {
+        if (toks[i2].t !== T.IDENT || isKwTypeCtx(toks[i2].v)) continue;
+        if (!(toks[i2 + 1] && toks[i2 + 1].v === '{')) continue;
+        if (i2 > 0) {
+          var p = toks[i2 - 1].v;
+          if (KEYWORD_PREVS[p] || p === '->' || p === ':' || p === '<' || p === '>' || p === '::' || p === 'as' || p === 'where' ||
+              p === '.' || p === 'dyn' || p === 'mut' || p === 'ref' || p === '&' || p === 'static' || p === '!' || p === '#') continue;
+        }
+        var nameTok = toks[i2], nm = nameTok.v;
+        if (!defs[nm] && !ctx.structs[nm]) {
+          // skip enum variant names listed inside their enum def
+          var isVarEntry = false;
+          for (var en in defs) { if (defs[en].enum && defs[en].fields && defs[en].fields[nm]) { isVarEntry = true; break; } }
+          if (isVarEntry) continue;
+          if (nm !== undefined && nm[0] >= 'A' && nm[0] <= 'Z') {
+            out.push({ msg: 'cannot find struct `' + nm + '` in this scope', line: nameTok.line, col: nameTok.col, spanLen: nm.length, _code: 'E0412' });
+          }
+          continue;
+        }
+        var e = findMatchTok(i2 + 1, '{', '}');
+        if (e === -1) continue;
+        // check fields amongst defined struct (unknown or dup or missing , )
+        var def = defs[nm];
+        if (!def) continue;
+        var parts = splitTopTok(i2 + 2, e);
+        var seenI = {};
+        for (var rp = 0; rp < parts.length; rp++) {
+          var part = parts[rp];
+          if (!part.length) continue;
+          if (part[0].v === '..') continue;
+          var fnameTok = part[0];
+          if (!(fnameTok.t === T.IDENT && !isKwTypeCtx(fnameTok.v))) continue;
+          if (part.length >= 3 && part[1].v === ':') { /* typed */ }
+          else if (part.length === 1 || (part.length === 2 && part[1].v === ',')) { /*shorthand*/ }
+          else if (part.length >= 2 && part[1].t === T.IDENT) {
+            out.push({ msg: 'missing comma between struct fields', line: part[1].line, col: part[1].col, spanLen: part[1].v.length });
+          }
+          if (fnameTok.t === T.IDENT && part[1] && part[1].v === ':') {
+            var fieldName = fnameTok.v;
+            // check for a second top-level ':' indicating missing comma
+            {
+              var colonCount = 0, bd = 0;
+              for (var ci2 = 0; ci2 < part.length; ci2++) {
+                var vp = part[ci2].v;
+                if (vp === '(' || vp === '[' || vp === '{' || vp === '<') bd++;
+                else if (vp === ')' || vp === ']' || vp === '}' || vp === '>') bd--;
+                else if (vp === ':' && bd === 0) colonCount++;
+              }
+              if (colonCount >= 2) {
+                out.push({ msg: 'missing comma between struct literal fields', line: part[1].line, col: part[1].col, spanLen: part[1].v.length });
+              }
+            }
+            if (seenI[fieldName]) {
+              out.push({ msg: 'duplicate field `' + fieldName + '`', line: fnameTok.line, col: fnameTok.col, spanLen: fieldName.length, _code: 'E0428' });
+            }
+            seenI[fieldName] = 1;
+            if (def && !def.fields[fieldName]) {
+              out.push({ msg: 'struct `' + nm + '` has no field `' + fieldName + '`', line: fnameTok.line, col: fnameTok.col, spanLen: fieldName.length, _code: 'E0560' });
+            }
+          }
+        }
+      }
+      return out.length ? out : null;
+    };
+
+    function knownStructuralTypeName(base) {
+      if (KNOWN_TYPES.hasOwnProperty(base) || ctx.structs.hasOwnProperty(base)) return true;
+      if (base === 'Self' || base === 'self') return true;
+      if (base[0] === 'u' || base[0] === 'i' || base[0] === 'f') return null;
+      return null;
+    }
+
+    function splitTopTok(lo, hi) {
+      var toks = ctx.toks, parts = [], depth = 0, cur = [];
+      for (var i = lo; i < hi; i++) {
+        var v = toks[i].v;
+        if (v === '(' || v === '[' || v === '{' || v === '<') depth++;
+        else if (v === ')' || v === ']' || v === '}' || v === '>') depth--;
+        if (depth === 0 && v === ',') { parts.push(cur); cur = []; continue; }
+        cur.push(toks[i]);
+      }
+      if (cur.length) parts.push(cur);
+      return parts;
+    }
+
+    function findMatchTok(from, open, close) {
+      var toks = ctx.toks, d = 0;
+      for (var i = from; i < toks.length; i++) {
+        if (toks[i].v === open) d++;
+        else if (toks[i].v === close) { d--; if (d === 0) return i; }
+      }
+      return -1;
+    }
+
+    function parseStructBodyItems(toks, start, end, isEnum, errTk) {
+      // top-level comma-split items between struct definition braces
+      var raw = [];
+      var depth = 0, cur = [], semi = false;
+      for (var i = start; i < end; i++) {
+        var v = toks[i].v;
+        if (v === ',' && depth === 0) { raw.push(cur); cur = []; continue; }
+        if (v === ';' && depth === 0) { raw.push(';'); semi = true; break; }
+        if (v === '(' || v === '[' || v === '{' || v === '<') depth++;
+        else if (v === ')' || v === ']' || v === '}' || v === '>') depth--;
+        cur.push(toks[i]);
+      }
+      if (cur.length) raw.push(cur);
+      // convert raw item-token-arrays into {name, fieldType, line, col}
+      var entries = {};
+      var named = [];
+      for (var ri = 0; ri < raw.length; ri++) {
+        if (raw[ri] === ';') { named.push(';'); break; }
+        var part = raw[ri];
+        if (!part.length) continue;
+        var name = part[0].t === T.IDENT ? part[0].v : null;
+        var fieldNameKnown = name;
+        // struct fields: `NAME: TYPE` ; enum variants: `NAME` or `NAME(...)` or `NAME { ... }`
+        var fieldType = null;
+        for (var pi = 1; pi < part.length; pi++) {
+          if (part[pi].v === ':') { fieldType = null; break; }
+        }
+        // struct field type is AFTER ':'
+        for (var pi2 = 0; pi2 < part.length; pi2++) {
+          if (part[pi2].v === ':') {
+            var afterColon = part[pi2 + 1];
+            if (afterColon && afterColon.t === T.IDENT) fieldType = afterColon.v;
+            break;
+          }
+        }
+        entries[name] = 1;
+        named.push({ name: name, fieldType: fieldType, line: part[0].line, col: part[0].col });
+      }
+      return { entries: entries, rawItems: named };
+    }
 
     ctx.checkDuplicateItem = function () {
       var dl3 = ctx.current;
