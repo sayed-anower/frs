@@ -250,6 +250,22 @@
       // ident / keyword
       if (U.isAlphaU(ch)) {
         var b0 = i, bl = line, bc = col;
+        // raw identifier: r#type / r#match (raw strings already consumed above,
+        // so `r#` + ident-start here is always a raw ident). Kept verbatim
+        // (`r#type`, not `type`) so decl/use sites resolve consistently and
+        // keyword tables are unaffected.
+        if (ch === 114 && src.charCodeAt(i + 1) === 35 &&
+            i + 2 < n && U.isAlphaU(src.charCodeAt(i + 2))) {
+          var re2 = i + 3;
+          while (re2 < n) {
+            var cr = src.charCodeAt(re2);
+            if (cr === 95 || (cr >= 48 && cr <= 57) || (cr >= 65 && cr <= 90) || (cr >= 97 && cr <= 122)) { re2++; }
+            else if (cr > 127) { re2++; }
+            else break;
+          }
+          push(T.IDENT, src.slice(i, re2), i, line, col);
+          col += (re2 - b0); i = re2; continue;
+        }
         i++; col++;
         while (i < n) {
           var cc2 = src.charCodeAt(i);

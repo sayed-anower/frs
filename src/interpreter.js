@@ -43,18 +43,93 @@
   var STDIN_STATE = null;
   function readStdinLine() {
     if (STDIN_STATE === null) {
-      STDIN_STATE = { pos: 0, buf: '' };
+      STDIN_STATE = { pos: 0, buf: '', tty: false };
       var isTTY = (typeof process !== 'undefined' && process.stdin && process.stdin.isTTY);
+      STDIN_STATE.tty = !!isTTY;
       if (!isTTY && FS_X) {
         try { STDIN_STATE.buf = FS_X.readFileSync(0, 'utf8'); } catch (e) { STDIN_STATE.buf = ''; }
       }
     }
+    // Interactive terminal: block for one line like Python's input().
+    // (Prompts are flushed to the terminal by the caller first.)
+    if (STDIN_STATE.tty) return readTtyLine();
     var b = STDIN_STATE.buf, p = STDIN_STATE.pos;
     if (p >= b.length) return '';
     var i = b.indexOf('\n', p);
     var line = i === -1 ? b.slice(p) : b.slice(p, i + 1);
     STDIN_STATE.pos = i === -1 ? b.length : i + 1;
     return line;
+  }
+  // Blocking single-line read from a terminal, byte-by-byte so no
+  // over-read: bytes after the first `\n` stay available for the next call.
+  // EOF (Ctrl+D) yields '' — Rust's `Ok(0)` at end of input.
+  function readTtyLine() {
+    try {
+      if (!FS_X || typeof FS_X.readSync !== 'function') return '';
+      if (typeof Buffer === 'undefined') return '';
+      // Never read fd 0 here when it is a real terminal: merely accessing
+      // `process.stdin` (even `.isTTY`) makes libuv put fd 0 in O_NONBLOCK,
+      // so raw fd-0 reads fail instantly with EAGAIN (busy "Invalid option"
+      // loop instead of waiting). A fresh open() of /dev/tty is blocking
+      // and immune to that. Non-terminal fd 0 (pipes, faked tests) is read
+      // directly — raw reads block fine there.
+      var useFd = ttyInputFd();
+      if (process.env.FRS_DEBUG_STDIN) process.stderr.write('[tty-read start fd=' + useFd + ']\n');
+      var bytes = [], one = Buffer.alloc(1);
+      while (bytes.length < 1048576) {
+        var n = 0;
+        try { n = FS_X.readSync(useFd, one, 0, 1); } catch (eR) {
+          if (process.env.FRS_DEBUG_STDIN) process.stderr.write('[tty-read threw ' + (eR && eR.code) + ' after ' + bytes.length + 'B]\n');
+          break;
+        }
+        if (!n) {
+          if (process.env.FRS_DEBUG_STDIN) process.stderr.write('[tty-read EOF after ' + bytes.length + 'B]\n');
+          break; // EOF
+        }
+        bytes.push(one[0]);
+        if (one[0] === 10) break; // '\n'
+      }
+      if (!bytes.length) return '';
+      return Buffer.from(bytes).toString('utf8');
+    } catch (e2) { return ''; }
+  }
+  // Input fd for terminal reads, cached for the process lifetime.
+  // Returns a fresh blocking /dev/tty fd when stdin itself is a terminal,
+  // else 0 (piped input, or no controlling terminal — e.g. Windows).
+  function ttyInputFd() {
+    if (STDIN_STATE.ttyFd === undefined || STDIN_STATE.ttyFd === null) {
+      var fd = 0;
+      var fd0IsTty = false;
+      try {
+        var s0 = FS_X.fstatSync(0);
+        fd0IsTty = !!(s0 && s0.isCharacterDevice && s0.isCharacterDevice());
+      } catch (eS) {}
+      if (fd0IsTty) {
+        try {
+          if (FS_X && typeof FS_X.openSync === 'function') {
+            var fresh = FS_X.openSync('/dev/tty', 'r');
+            if (typeof fresh === 'number' && fresh >= 0) fd = fresh;
+          }
+        } catch (eO) { fd = 0; }
+      }
+      STDIN_STATE.ttyFd = fd;
+    }
+    return STDIN_STATE.ttyFd;
+  }
+  // Write out everything the program printed so far, so prompts are visible
+  // BEFORE a blocking terminal read. Flushed text is marked on the array so
+  // run() does not return (and re-print) it a second time.
+  function flushProgramStdout(st) {
+    try {
+      if (typeof process === 'undefined' || !process.stdout || !process.stdout.isTTY) return;
+      var arr = st && st.stdout;
+      if (!arr || typeof arr.push !== 'function' || typeof process.stdout.write !== 'function') return;
+      var from = arr.__flushed || 0;
+      if (arr.length > from) {
+        process.stdout.write(arr.slice(from).join(''));
+        arr.__flushed = arr.length;
+      }
+    } catch (eF) {}
   }
   function run(src, opts) {
     opts = opts || {};
@@ -134,7 +209,9 @@
     for (var oi = 0; oi < openFds.length; oi++) { try { FS_X && FS_X.closeSync(openFds[oi]); } catch (eO) {} }
     if (!NET_LISTENING) { for (var si = 0; si < TCP_SRVS.length; si++) { try { TCP_SRVS[si].close(); } catch (eS) {} } }
 
-    var out = stdout.join('');
+    // Text already flushed live to a terminal during interactive reads is
+    // not returned again (the CLI would print it twice).
+    var out = stdout.slice(stdout.__flushed || 0).join('');
     var serving = NET_LISTENING;
     if (out.length > MAX_OUT) out = out.slice(0, MAX_OUT);
     return {
@@ -1084,6 +1161,9 @@
       return '[' + val.items.map(function (x) { return rustToString(x); }).join(', ') + ']';
     }
     if ((spec || '').indexOf('?') !== -1) return rustDebug(val);
+    // float precision `{:.2}` (widths still render plainly)
+    var pm = /\.(\d+)/.exec(spec || '');
+    if (pm && typeof val === 'number' && isFinite(val)) return val.toFixed(parseInt(pm[1], 10));
     return rustToString(val);
   }
 
@@ -1294,8 +1374,9 @@
     // closure literal: |x, y| expr  /  |x: i32| expr  /  || expr  /  move |x| expr
     var cStart = 0;
     if (toks[0].v === 'move' && toks[1] && toks[1].v === '|' && toks[1].t === T.SYMBOL) cStart = 1;
-    if (toks[0].v === '||') {
-      return { value: { __rust: 'closure', params: [], body: toks.slice(1) }, type: 'closure' };
+    if (toks[0].v === '||' || (toks[0].v === 'move' && toks[1] && toks[1].v === '||')) {
+      var b0 = toks[0].v === '||' ? 1 : 2;
+      return { value: { __rust: 'closure', params: [], body: toks.slice(b0) }, type: 'closure' };
     }
     if (toks[cStart].v === '|' && toks[cStart].t === T.SYMBOL) {
       var cparams = [], cend = -1;
@@ -1319,6 +1400,14 @@
     if (st.macros && toks.length >= 3 && toks[0].t === T.IDENT && toks[1].v === '!' && st.macros[toks[0].v]) {
       var mgre = expandMacro(toks[0].v, toks.slice(3, matchTok(toks, 2, toks[2].v, toks[2].v === '(' ? ')' : toks[2].v === '[' ? ']' : '}') === -1 ? toks.length : matchTok(toks, 2, toks[2].v, toks[2].v === '(' ? ')' : toks[2].v === '[' ? ']' : '}')), env, fns, st);
       if (mgre) return evalExpr(mgre, env, fns, st);
+    }
+    // cfg!(...) as value: evaluated for this host (linux/mac/windows via
+    // Node; unknown hosts stay lenient/true), exactly like rustc.
+    if (toks.length >= 3 && toks[0].t === T.IDENT && toks[0].v === 'cfg' && toks[1].v === '!') {
+      var oi3 = 2;
+      var ce3 = matchTok(toks, oi3, toks[oi3].v, toks[oi3].v === '(' ? ')' : toks[oi3].v === '[' ? ']' : '}');
+      var pred3 = toks.slice(oi3 + 1, ce3 === -1 ? toks.length : ce3);
+      return { value: evalCfgPredI(pred3, hostOsInfo()), type: 'bool' };
     }
     // format!(...) as value
     if (toks.length >= 3 && toks[0].t === T.IDENT && toks[0].v === 'format' && toks[1].v === '!') {
@@ -1418,10 +1507,13 @@
       var sBaseToks = toks.slice(0, brC);
       var sBaseVal = evalExpr(sBaseToks, env, fns, st).value;
       var sIn = toks.slice(brC + 1, toks.length - 1);
-      var sidx = -1;
-      for (var jj = 0; jj < sIn.length; jj++) { if (sIn[jj].v === '..') { sidx = jj; break; } }
+      var sidx = -1, sidxIncl = false;
+      for (var jj = 0; jj < sIn.length; jj++) {
+        if (sIn[jj].v === '..') { sidx = jj; break; }
+        if (sIn[jj].v === '..=') { sidx = jj; sidxIncl = true; break; }
+      }
       var sItems = (sBaseVal !== null && typeof sBaseVal === 'object' && sBaseVal.__rust === 'vec') ? sBaseVal.items : (typeof sBaseVal === 'string' ? sBaseVal.split('') : []);
-      var slo = 0, shi = sItems.length, sincl = false;
+      var slo = 0, shi = sItems.length, sincl = sidxIncl;
       if (sidx === -1) {
         var sv = Math.floor(num(evalExpr(sIn, env, fns, st).value));
         return { value: sv >= 0 && sv < sItems.length ? sItems[sv] : 0, type: 'unknown' };
@@ -1469,8 +1561,13 @@
         return pvv;
       }
     }
-    // path value (no call): Dir::North / std::u8::MAX -> symbolic enum value
+    // path value (no call): Dir::North / std::u8::MAX -> symbolic enum value.
+    // `std::env::consts::{OS,FAMILY,ARCH,...}` resolve to this host instead.
     if (toks.length >= 3 && isPathValue(toks)) {
+      if (toks.length >= 5 && toks[toks.length - 3].v === 'consts') {
+        var hcv = hostConstValue(toks[toks.length - 1].v);
+        if (hcv !== null) return { value: hcv, type: '&str' };
+      }
       return { value: { __rust: 'enum', path: toks.map(function (t) { return t.v; }).join('') }, type: 'unknown' };
     }
     // method call: expr.method(args)
@@ -1642,6 +1739,8 @@
         for (var qx = 0; qx < rlArgs.length; qx++) {
           if (rlArgs[qx].t === T.IDENT && rlArgs[qx].v !== 'mut' && rlArgs[qx].v !== 'ref' && rlArgs[qx].v !== '&') { rlName = rlArgs[qx].v; break; }
         }
+        // On a terminal, show pending prompts BEFORE blocking for input.
+        flushProgramStdout(st);
         var rline = readStdinLine();
         if (rlName) {
           var own = env;
@@ -1678,9 +1777,10 @@
         }
       }
       // vec/iterator chains: `.iter().map(f).filter(g).collect()` / `.for_each`
+      // (items are shared refs, so `iter_mut().find(..)` + field writes persist)
       if (base && typeof base === 'object' && base.__rust === 'vec' &&
-          (mname === 'iter' || mname === 'into_iter' || mname === 'values' || mname === 'map' || mname === 'filter' || mname === 'collect' || mname === 'for_each' || mname === 'cloned' || mname === 'rev')) {
-        if (mname === 'iter' || mname === 'into_iter' || mname === 'values' || mname === 'clone' || mname === 'cloned' || mname === 'rev') {
+          (mname === 'iter' || mname === 'iter_mut' || mname === 'into_iter' || mname === 'values' || mname === 'map' || mname === 'filter' || mname === 'find' || mname === 'retain' || mname === 'collect' || mname === 'for_each' || mname === 'cloned' || mname === 'rev')) {
+        if (mname === 'iter' || mname === 'iter_mut' || mname === 'into_iter' || mname === 'values' || mname === 'clone' || mname === 'cloned' || mname === 'rev') {
           var rv2 = mname === 'rev' ? { __rust: 'vec', items: base.items.slice().reverse() } : base;
           if (dotCall.close < toks.length - 1) return finishMethodResult(rv2, toks.slice(dotCall.close + 1), env, fns, st);
           return { value: rv2, type: 'Vec<_>' };
@@ -1689,12 +1789,32 @@
           if (dotCall.close < toks.length - 1) return finishMethodResult(base, toks.slice(dotCall.close + 1), env, fns, st);
           return { value: base, type: 'Vec<_>' };
         }
-        // map / filter / for_each take a closure arg
+        // map / filter / find / retain / for_each take a closure arg
         var cvt = (margVals.length && margVals[0] && margVals[0].__rust === 'closure') ? margVals[0] : null;
         if (!cvt) {
           if (mname === 'for_each' && margVals.length === 0) { /* nothing */ }
           if (dotCall.close < toks.length - 1) return finishMethodResult(base, toks.slice(dotCall.close + 1), env, fns, st);
           return { value: base, type: 'unknown' };
+        }
+        if (mname === 'find') {
+          var found = null, hasFound = false;
+          for (var fi9 = 0; fi9 < base.items.length && fi9 < MAX_LOOP; fi9++) {
+            var rf = evalClosureValues(cvt, [{ value: base.items[fi9], type: 'unknown' }], env, fns, st);
+            if (truthy(rf.value)) { found = base.items[fi9]; hasFound = true; break; }
+          }
+          var fopt = { __rust: 'option', some: hasFound, value: found };
+          if (dotCall.close < toks.length - 1) return finishMethodResult(fopt, toks.slice(dotCall.close + 1), env, fns, st);
+          return { value: fopt, type: 'Option<_>' };
+        }
+        if (mname === 'retain') {
+          var kept = [];
+          for (var rk = 0; rk < base.items.length && rk < MAX_LOOP; rk++) {
+            var rr2 = evalClosureValues(cvt, [{ value: base.items[rk], type: 'unknown' }], env, fns, st);
+            if (truthy(rr2.value)) kept.push(base.items[rk]);
+          }
+          base.items = kept;
+          if (dotCall.close < toks.length - 1) return finishMethodResult(undefined, toks.slice(dotCall.close + 1), env, fns, st);
+          return { value: undefined, type: '()' };
         }
         var out = [];
         for (var mi = 0; mi < base.items.length && mi < MAX_LOOP; mi++) {
@@ -1718,17 +1838,59 @@
       var r = evalMethod(base, mname, margVals);
       return finishMethodResult(r, toks.slice(dotCall.close + 1), env, fns, st);
     }
-    // field access: expr.field (no parens — methods handled above)
+    // field access: expr.field / tuple `.0` (no parens — methods handled above).
+    // Precedence: leading unary `!`/`-`, top-level binops and `as` casts all
+    // bind looser than `.` — when one governs, skip here so its own splitter
+    // runs first (it recurses back for the field part).
     var fdot = topFieldDot(toks);
+    if (fdot !== -1) {
+      if (fdot > 0 && (toks[0].v === '!' || toks[0].v === '-')) fdot = -1;
+      else {
+        var fbi = topBinOp(toks);
+        if (fbi !== -1 && fbi < fdot) fdot = -1;
+        else if (topAsCast(toks) !== -1) fdot = -1;
+      }
+    }
     if (fdot !== -1) {
       var fbase = evalExpr(toks.slice(0, fdot), env, fns, st).value;
       var ff = toks[fdot + 1].v;
       // `.await` is a transparent no-op: async runs synchronously in this engine
       // (tokio/actix futures execute inline; `x.await?` still unwraps via `?`).
       if (ff === 'await') return finishMethodResult(fbase, toks.slice(fdot + 2), env, fns, st);
-      var fvv = (fbase !== null && typeof fbase === 'object' && fbase.__rust === 'struct' &&
-        Object.prototype.hasOwnProperty.call(fbase.fields, ff)) ? fbase.fields[ff] : 0;
       var frest = toks.slice(fdot + 2);
+      var fIsIdx = /^(0|[1-9][0-9]*)$/.test(ff);
+      // field assignment `obj.field = v` / `op=`: write through (struct
+      // objects and vecs are shared refs, so `item.x = ..` persists).
+      if (frest.length && (frest[0].v === '=' || frest[0].v === '+=' || frest[0].v === '-=' ||
+          frest[0].v === '*=' || frest[0].v === '/=' || frest[0].v === '%=')) {
+        var fHolder = null, fKey = null;
+        if (fbase !== null && typeof fbase === 'object' && fbase.__rust === 'struct' && fbase.fields) {
+          fHolder = fbase.fields; fKey = ff;
+        } else if (fbase !== null && typeof fbase === 'object' && fbase.__rust === 'vec' && fIsIdx) {
+          fHolder = fbase.items; fKey = parseInt(ff, 10);
+        }
+        var fRhsV = evalExpr(frest.slice(1), env, fns, st).value;
+        if (fHolder !== null && fKey !== null) {
+          if (frest[0].v === '=') fHolder[fKey] = fRhsV;
+          else {
+            var fCurV = (fHolder[fKey] !== undefined && fHolder[fKey] !== null &&
+              typeof fHolder[fKey] === 'object' && 'value' in fHolder[fKey]) ? fHolder[fKey].value : fHolder[fKey];
+            var fOp = frest[0].v[0];
+            fHolder[fKey] = fOp === '+' ? num(fCurV) + num(fRhsV) : fOp === '-' ? num(fCurV) - num(fRhsV)
+              : fOp === '*' ? num(fCurV) * num(fRhsV) : fOp === '/' ? (num(fRhsV) === 0 ? num(fCurV) : num(fCurV) / num(fRhsV))
+              : num(fCurV) % num(fRhsV);
+          }
+          return { value: fHolder[fKey], type: 'unknown' };
+        }
+        return { value: 0, type: 'unknown' };
+      }
+      var fvv;
+      if (fbase !== null && typeof fbase === 'object' && fbase.__rust === 'struct' &&
+        Object.prototype.hasOwnProperty.call(fbase.fields, ff)) fvv = fbase.fields[ff];
+      else if (fbase !== null && typeof fbase === 'object' && fbase.__rust === 'vec' && fIsIdx) {
+        var fi0 = parseInt(ff, 10);
+        fvv = (fi0 >= 0 && fi0 < fbase.items.length) ? fbase.items[fi0] : 0;
+      } else fvv = 0;
       if (!frest.length) return { value: fvv, type: 'unknown' };
       return finishMethodResult(fvv, frest, env, fns, st);
     }
@@ -1797,13 +1959,27 @@
       var R = evalExpr(toks.slice(bi + 1), env, fns, st).value;
       return { value: applyOp(L, OP, R), type: 'unknown' };
     }
-    // range a..b as value? represent as vec
+    // `expr as Type`: numeric casts keep the JS number (bool/char widen too)
+    var ai2 = topAsCast(toks);
+    if (ai2 !== -1) {
+      var cv = evalExpr(toks.slice(0, ai2), env, fns, st).value;
+      var tnx = toks.slice(ai2 + 1).map(function (t) { return t.v; }).join('');
+      if (/^(u8|u16|u32|u64|u128|usize|i8|i16|i32|i64|i128|isize)$/.test(tnx)) return { value: Math.trunc(num(cv)), type: tnx };
+      if (/^(f32|f64)$/.test(tnx)) return { value: num(cv), type: tnx };
+      if (tnx === 'bool') return { value: truthy(cv), type: 'bool' };
+      if (tnx === 'char') return { value: String.fromCodePoint(Math.trunc(num(cv)) || 0), type: 'char' };
+      return { value: cv, type: 'unknown' };
+    }
+    // range a..b / a..=b as value? represent as vec
+    // (the lexer emits `..=` as one token; split `..` `=` handled too)
     var ri = topIndex(toks, '..');
+    var riIncl = false;
+    if (ri === -1) { ri = topIndex(toks, '..='); if (ri !== -1) riIncl = true; }
     if (ri !== -1) {
       var a2 = Math.floor(num(evalExpr(toks.slice(0, ri), env, fns, st).value));
       var rest = toks.slice(ri + 1);
-      var incl = false;
-      if (rest.length && rest[0].v === '=') { incl = true; rest = rest.slice(1); }
+      var incl = riIncl;
+      if (!incl && rest.length && rest[0].v === '=') { incl = true; rest = rest.slice(1); }
       var b2 = Math.floor(num(evalExpr(rest, env, fns, st).value));
       var lo = Math.min(a2, b2), hi2 = incl ? b2 + 1 : b2, rr = [];
       for (var q2 = lo; q2 < hi2 && rr.length < MAX_LOOP; q2++) rr.push(q2);
@@ -1865,7 +2041,9 @@
       var v = toks[i].v;
       if (v === '(' || v === '[' || v === '{') d++;
       else if (v === ')' || v === ']' || v === '}') d--;
-      else if (d === 0 && v === '.' && toks[i + 1] && toks[i + 1].t === T.IDENT &&
+      // `.field` or tuple index `.0` (a following `(` means method call)
+      else if (d === 0 && v === '.' && toks[i + 1] &&
+               (toks[i + 1].t === T.IDENT || toks[i + 1].t === T.NUMBER) &&
                (!toks[i + 2] || toks[i + 2].v !== '(')) return i;
     }
     return -1;
@@ -1879,6 +2057,105 @@
       else if (d === 0 && v === op) return i;
     }
     return -1;
+  }
+
+  function topAsCast(toks) {
+    // depth-0 `as` keyword (cast); `r#as` raw idents never equal this
+    var d = 0;
+    for (var i = 0; i < toks.length; i++) {
+      var t = toks[i], v = t.v;
+      if (v === '(' || v === '[' || v === '{') d++;
+      else if (v === ')' || v === ']' || v === '}') d--;
+      else if (d === 0 && v === 'as' && t.t === T.IDENT) return i;
+    }
+    return -1;
+  }
+
+  // ---- host OS info (linux/mac/windows via Node; nulls when unknown) ----
+  // Drives `cfg!(..)`, `std::env::consts::*` and mirrors the rule-side
+  // `#[cfg]` gating so checks and runs agree on every host.
+  function hostOsInfo() {
+    try {
+      if (typeof process !== 'undefined' && process && process.platform) {
+        var p = process.platform;
+        var os = p === 'win32' ? 'windows' : p === 'darwin' ? 'macos' : p === 'linux' ? 'linux' : null;
+        var fam = p === 'win32' ? 'windows' : (os ? 'unix' : null);
+        var arch = null;
+        try {
+          var pa = process.arch;
+          arch = pa === 'x64' ? 'x86_64' : pa === 'arm64' ? 'aarch64' : pa === 'ia32' ? 'x86' : (typeof pa === 'string' ? pa : null);
+        } catch (eA) {}
+        return { os: os, family: fam, arch: arch };
+      }
+    } catch (eH) {}
+    return { os: null, family: null, arch: null };
+  }
+
+  function hostConstValue(key) {
+    var h = hostOsInfo();
+    if (key === 'OS') return h.os || 'unknown';
+    if (key === 'FAMILY') return h.family || 'unknown';
+    if (key === 'ARCH') return h.arch || 'unknown';
+    if (key === 'DLL_PREFIX') return h.os === 'windows' ? '' : 'lib';
+    if (key === 'DLL_SUFFIX' || key === 'DLL_EXTENSION') {
+      return h.os === 'windows' ? 'dll' : h.os === 'macos' ? 'dylib' : 'so';
+    }
+    if (key === 'EXE_SUFFIX' || key === 'EXE_EXTENSION') return h.os === 'windows' ? 'exe' : '';
+    return null;
+  }
+
+  function evalCfgPredI(pred, host) {
+    var pos = 0;
+    function peek() { return pos < pred.length ? pred[pos].v : null; }
+    function parseOr() {
+      var v = parseAtom();
+      while (peek() === ',') { pos++; var rhs = parseAtom(); v = v || rhs; }
+      return v;
+    }
+    function parseAtom() {
+      var w = peek();
+      if (w === 'not' && pred[pos + 1] && pred[pos + 1].v === '(') {
+        pos += 2;
+        var nv = parseOr();
+        if (peek() === ')') pos++;
+        return !nv;
+      }
+      if ((w === 'any' || w === 'all') && pred[pos + 1] && pred[pos + 1].v === '(') {
+        var isAny = w === 'any';
+        pos += 2;
+        var acc = isAny ? false : true;
+        while (pos < pred.length && peek() !== ')') {
+          if (peek() === ',') { pos++; continue; }
+          var cv = parseAtom();
+          acc = isAny ? (acc || cv) : (acc && cv);
+        }
+        if (peek() === ')') pos++;
+        return acc;
+      }
+      var key = w;
+      pos++;
+      if (peek() === '=') {
+        pos++;
+        var val = peek() || '';
+        pos++;
+        if (val.length >= 2 && val[0] === '"' && val[val.length - 1] === '"') val = val.slice(1, -1);
+        if (key === 'target_os') return host.os ? host.os === val : true;
+        if (key === 'target_family') return host.family ? host.family === val : true;
+        if (key === 'target_arch') return host.arch ? host.arch === val : true;
+        return true;
+      }
+      if (key === 'test' || key === 'doc') return false;
+      if (key === 'debug_assertions') return true;
+      if (key === 'unix') return host.family ? host.family === 'unix' : true;
+      if (key === 'windows') return host.family ? host.family === 'windows' : true;
+      if (key === 'linux' || key === 'macos' || key === 'ios' ||
+          key === 'android' || key === 'freebsd' || key === 'openbsd') {
+        return host.os ? host.os === key : true;
+      }
+      return true;
+    }
+    if (!pred.length) return true;
+    return !!parseOr();
   }
 
   function applyOp(L, OP, R) {
@@ -2024,9 +2301,13 @@
   function evalClosure(cv, cparts, env, fns, st) {
     var cchild = Object.create(env);
     for (var cp2 = 0; cp2 < cv.params.length; cp2++) {
-      cchild[cv.params[cp2]] = (cp2 < cparts.length && cparts[cp2].length)
-        ? evalExpr(cparts[cp2], env, fns, st) : { value: 0, type: 'unknown' };
-      trackRefBind(cchild, cv.params[cp2], cp2 < cparts.length ? cparts[cp2] : []);
+      var cpt2 = cp2 < cparts.length ? cparts[cp2] : [];
+      // same self-reborrow rule as fn params (see execFnBody)
+      if (!(cpt2.length && refTargetOf(cpt2) === cv.params[cp2])) {
+        cchild[cv.params[cp2]] = (cp2 < cparts.length && cparts[cp2].length)
+          ? evalExpr(cparts[cp2], env, fns, st) : { value: 0, type: 'unknown' };
+      }
+      trackRefBind(cchild, cv.params[cp2], cpt2);
     }
     try { return evalExpr(cv.body.slice(), cchild, fns, st); }
     catch (e2) {
@@ -2185,10 +2466,15 @@
     }
     for (var p = pStart; p < fn.params.length; p++) {
       var ai = p - (hasSelf ? 1 : 0) + (hasSelf ? (selfVal !== undefined ? 0 : 1) : 0);
+      var argToksP = (ai >= 0 && ai < parts2.length) ? parts2[ai] : [];
       var pv = (ai >= 0 && ai < parts2.length && parts2[ai].length) ? evalExpr(parts2[ai], env, fns, st) : { value: 0, type: 'unknown' };
-      child[fn.params[p]] = pv;
+      // Direct self-reborrow `f(&mut n)` with the param also named `n`:
+      // keep NO local copy — reads/writes fall through to the caller's
+      // binding, so `*n += 1` writes back. (A value copy here would shadow
+      // the caller's slot and silently lose every write-back.)
+      if (refTargetOf(argToksP) !== fn.params[p]) child[fn.params[p]] = pv;
       // `foo(&mut h)` aliases param -> caller's var so `*s = ...` writes back
-      trackRefBind(child, fn.params[p], (ai >= 0 && ai < parts2.length) ? parts2[ai] : []);
+      trackRefBind(child, fn.params[p], argToksP);
     }
     var O3 = st.stdout || { push: function () { } };
     var E3 = st.stderr || { push: function () { } };
@@ -2264,7 +2550,7 @@
         var rhs;
         try { rhs = evalExpr(toks.slice(eq + 1), env, fns, st).value; }
         catch (e) { if (e && e.__frsPanic) throw e; rhs = 0; }
-        try { return matchPat(toks.slice(1, eq), rhs, env); }
+        try { return matchPat(toks.slice(1, eq), rhs, env, fns, st); }
         catch (e2) { if (e2 && e2.__frsPanic) throw e2; return false; }
       }
     }
@@ -2549,18 +2835,30 @@
       else if (inner[k].v === ')' || inner[k].v === ']' || inner[k].v === '}') depth--;
       else if (depth === 0 && inner[k].v === '=>') {
         var pat = cur; cur = [];
-        // body: until `,` at depth 0 or end
-        var bd = 0, bstart = k + 1, bend = -1;
-        for (var j = k + 1; j < inner.length; j++) {
-          var w = inner[j].v;
-          if (w === '(' || w === '[' || w === '{') bd++;
-          else if (w === ')' || w === ']' || w === '}') bd--;
-          else if (bd === 0 && w === ',') { bend = j; break; }
+        // body: a `{...}` block needs no trailing `,` (valid Rust omits it);
+        // an expression body runs until `,` at depth 0 or the end.
+        var bstart = k + 1, bend = -1, afterBody = -1;
+        if (inner[bstart] && inner[bstart].v === '{') {
+          var bex = matchTok(inner, bstart, '{', '}');
+          if (bex !== -1) {
+            bend = bex + 1;
+            afterBody = (inner[bend] && inner[bend].v === ',') ? bend + 1 : bend;
+          }
         }
-        var body = bend === -1 ? inner.slice(bstart) : inner.slice(bstart, bend);
+        if (afterBody === -1) {
+          var bd = 0;
+          for (var j = bstart; j < inner.length; j++) {
+            var w = inner[j].v;
+            if (w === '(' || w === '[' || w === '{') bd++;
+            else if (w === ')' || w === ']' || w === '}') bd--;
+            else if (bd === 0 && w === ',') { bend = j; afterBody = j + 1; break; }
+          }
+          if (afterBody === -1) { bend = inner.length; afterBody = inner.length; }
+        }
+        var body = inner.slice(bstart, bend);
         arms.push({ pat: pat, body: body });
         cur = [];
-        k = bend === -1 ? inner.length : bend + 1;
+        k = afterBody;
         continue;
       }
       cur.push(inner[k]);
@@ -2568,7 +2866,7 @@
     }
     for (var a = 0; a < arms.length; a++) {
       try {
-        if (matchPat(arms[a].pat, svalRaw, env)) {
+        if (matchPat(arms[a].pat, svalRaw, env, fns, st)) {
           return { next: end + 1, armBody: arms[a].body };
         }
       } catch (e2) { if (e2 && e2.__frsPanic) throw e2; }
@@ -2583,15 +2881,77 @@
 
   // destructure-match a pattern against a runtime value; binds idents; returns matched?
   // (shared by `match` arms and `if/while let` conditions)
-  function matchPat(pat, val, env) {
+  function matchPat(pat, val, env, fns, st) {
     if (!pat.length) return false;
-    // strip guard `if ...` (assume it passes — conditions already evaluate elsewhere)
+    // match guard `if ...`: evaluated AFTER the core pattern matches, with
+    // the arm bindings in scope (real Rust semantics).
     var g = -1;
     for (var gi = 0; gi < pat.length; gi++) {
       if (pat[gi].t === T.IDENT && pat[gi].v === 'if') { g = gi; break; }
     }
     var core = g === -1 ? pat : pat.slice(0, g);
+    var guard = g === -1 ? null : pat.slice(g + 1);
     if (!core.length) return false;
+    // top-level `|` alternatives: first match wins (binds on success)
+    var depth = 0, start = 0, alt = null;
+    for (var oi = 0; oi <= core.length; oi++) {
+      var ov = oi < core.length ? core[oi].v : '|';
+      if (oi < core.length) {
+        if (ov === '(' || ov === '[' || ov === '{') depth++;
+        else if (ov === ')' || ov === ']' || ov === '}') depth--;
+      }
+      if (ov === '|' && depth === 0) {
+        if (alt === null) alt = [];
+        alt.push(core.slice(start, oi));
+        start = oi + 1;
+      }
+    }
+    if (alt !== null) {
+      for (var ao = 0; ao < alt.length; ao++) {
+        if (matchCore(alt[ao], val, env, fns, st) && guardOk(guard, env, fns, st)) return true;
+      }
+      return false;
+    }
+    if (!matchCore(core, val, env, fns, st)) return false;
+    return guardOk(guard, env, fns, st);
+  }
+
+  function guardOk(guard, env, fns, st) {
+    if (!guard || !guard.length) return true;
+    if (!fns || !st) return true; // engine fallback: assume it passes
+    try { return truthy(evalExpr(guard.slice(), env, fns, st).value); }
+    catch (e) { if (e && e.__frsPanic) throw e; return true; }
+  }
+
+  function matchCore(core, val, env, fns, st) {
+    if (!core.length) return false;
+    // `name @ subpat`: match the sub-pattern, bind the name on success
+    if (core.length >= 3 && core[0].t === T.IDENT && core[1].v === '@' &&
+        !(core[0].v[0] >= 'A' && core[0].v[0] <= 'Z')) {
+      var sub = core.slice(2);
+      // sub-pattern may itself hold `|` alternatives
+      var od = 0, os = 0, oalt = null;
+      for (var ox = 0; ox <= sub.length; ox++) {
+        var ow = ox < sub.length ? sub[ox].v : '|';
+        if (ox < sub.length) {
+          if (ow === '(' || ow === '[' || ow === '{') od++;
+          else if (ow === ')' || ow === ']' || ow === '}') od--;
+        }
+        if (ow === '|' && od === 0) {
+          if (oalt === null) oalt = [];
+          oalt.push(sub.slice(os, ox));
+          os = ox + 1;
+        }
+      }
+      var ok = oalt !== null
+        ? oalt.some(function (a) { return matchCore(a, val, env, fns, st); })
+        : matchCore(sub, val, env, fns, st);
+      if (ok) {
+        if (core[0].v !== '_') env[core[0].v] = { value: val, type: 'unknown' };
+        return true;
+      }
+      return false;
+    }
     // strip binding modifiers: `mut x`, `ref x`, `&x`, `&mut x`
     var stripped = true;
     while (stripped && core.length) {
@@ -2642,7 +3002,7 @@
         if (sfa[0].v === '.' ) continue; // `..` rest
         if (sfa.length >= 3 && sfa[0].t === T.IDENT && sfa[1].v === ':') {
           var svv = Object.prototype.hasOwnProperty.call(sfields, sfa[0].v) ? sfields[sfa[0].v] : 0;
-          matchPat(sfa.slice(2), svv, env);
+          matchPat(sfa.slice(2), svv, env, fns, st);
         } else if (sfa.length === 1 && sfa[0].t === T.IDENT && sfa[0].v !== '_') {
           env[sfa[0].v] = {
             value: Object.prototype.hasOwnProperty.call(sfields, sfa[0].v) ? sfields[sfa[0].v] : 0,
@@ -2660,35 +3020,36 @@
       var csub = splitArgs(cinner);
       if (cname === 'Some') {
         if (!isSome(val)) return false;
-        return csub.length === 1 ? matchPat(csub[0], val.value, env) : true;
+        return csub.length === 1 ? matchPat(csub[0], val.value, env, fns, st) : true;
       }
       if (cname === 'Ok') {
         if (!isOk(val)) return false;
-        return csub.length === 1 ? matchPat(csub[0], val.value, env) : true;
+        return csub.length === 1 ? matchPat(csub[0], val.value, env, fns, st) : true;
       }
       if (cname === 'Err') {
         if (!isErr(val)) return false;
-        return csub.length === 1 ? matchPat(csub[0], val.value, env) : true;
+        return csub.length === 1 ? matchPat(csub[0], val.value, env, fns, st) : true;
       }
       if (val !== null && typeof val === 'object' && val.__rust === 'ctor' &&
           val.name === cname && val.args.length === csub.length) {
         for (var ca = 0; ca < csub.length; ca++) {
-          if (!matchPat(csub[ca], val.args[ca], env)) return false;
+          if (!matchPat(csub[ca], val.args[ca], env, fns, st)) return false;
         }
         return true;
       }
       return true; // unknown shape: lenient
     }
-    // range pattern `1..=5` / `1..5`
+    // range pattern `1..=5` (inclusive) / `1..5` (exclusive end)
     for (var r = 0; r < core.length; r++) {
-      if (core[r].v === '..') {
-        var lo = parseFloat(core[0] ? core[0].v : 'NaN');
+      if (core[r].v === '..' || core[r].v === '..=') {
+        var incl = core[r].v === '..=';
         var rrest = core.slice(r + 1);
-        if (rrest.length && rrest[0].v === '=') rrest = rrest.slice(1);
+        if (!incl && rrest.length && rrest[0].v === '=') { incl = true; rrest = rrest.slice(1); }
+        var lo = parseFloat(core[0] ? core[0].v : 'NaN');
         var hi = parseFloat(rrest.length ? rrest[rrest.length - 1].v : 'NaN');
+        if (isNaN(lo) || isNaN(hi)) return false;
         var sv2 = num(val);
-        if (!isNaN(lo) && !isNaN(hi) && sv2 >= lo && sv2 <= hi) return true;
-        return false;
+        return incl ? (sv2 >= lo && sv2 <= hi) : (sv2 >= lo && sv2 < hi);
       }
     }
     return true;

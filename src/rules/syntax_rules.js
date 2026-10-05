@@ -107,6 +107,8 @@
     var T = shared.T || { IDENT: 1 };
     var BLOCK_KW = shared.BLOCK_KW || {};
 
+    installCfgHelper(ctx);
+
     ctx.checkUnbalanced = function () {
       var out = [];
       var strayCloses = ctx.strayCloses, stack = ctx.stack;
@@ -162,6 +164,7 @@
       var st = ctx.current;
       if (!st) return null;
       if (st.kind === 'let') {
+        if (ctx.isCfgGatedOut && ctx.isCfgGatedOut(st.nameLine, st.nameCol)) return null;
         if (!st.hasSemi && !st.missingName) {
           return {
             msg: 'expected `;`, found end of statement', line: st.nameLine, col: st.nameCol + st.nameLen,
@@ -171,6 +174,7 @@
         return null;
       }
       if (st.kind === 'assign') {
+        if (ctx.isCfgGatedOut && ctx.isCfgGatedOut(st.line, st.col)) return null;
         if (!st.hasSemi) {
           return { msg: 'expected `;`, found end of statement', line: st.line, col: st.col + st.spanLen, spanLen: 1, label: '', hint: 'add `;` here' };
         }
@@ -181,6 +185,7 @@
     ctx.checkLetBinding = function () {
       var st2 = ctx.current;
       if (st2 && st2.kind === 'let' && st2.missingName) {
+        if (ctx.isCfgGatedOut && ctx.isCfgGatedOut(st2.line, st2.col)) return null;
         return { msg: 'expected identifier, found `' + (st2.valToks[0] ? st2.valToks[0].v : 'end') + '`', line: st2.line, col: st2.col + 4, spanLen: 1, label: 'expected a binding name', hint: 'write `let x = ...;`' };
       }
       return null;
@@ -189,6 +194,7 @@
     ctx.checkFnName = function () {
       var st3 = ctx.current;
       if (st3 && st3.kind === 'fn' && st3.fnameMissing) {
+        if (ctx.isCfgGatedOut && ctx.isCfgGatedOut(st3.line, st3.col)) return null;
         return { msg: 'expected function name after `fn`', line: st3.line, col: st3.col + 3, spanLen: 1, label: 'expected a name', hint: 'write `fn name() { ... }`' };
       }
       return null;
@@ -198,10 +204,14 @@
       var st4 = ctx.current;
       if (!st4) return null;
       var toks = ctx.toks, n = toks.length;
+      if (ctx.isCfgGatedOut && ctx.isCfgGatedOut(st4.line, st4.col)) return null;
       if (st4.kind === 'fn' && st4.name && st4.params !== -1 && st4.bodyOpen === -1 && !st4.hasSemiDecl) {
         return { msg: 'expected `{` after function signature', line: st4.line, col: st4.col + st4.spanLen, spanLen: 1, label: 'expected a block', hint: 'add `{ ... }` here' };
       }
       if (st4.kind === 'stmt' && BLOCK_KW[st4.kw]) {
+        // match-guard `if` (`Some(x) if x > 1 => ...`) takes no block —
+        // it ends at `=>`, not `{`. Detect: `=>` before any `{`/`;`.
+        if (st4.kw === 'if' && isMatchGuard(st4.idx)) return null;
         if (st4.kw === 'for' || st4.kw === 'while' || st4.kw === 'loop') {
           if (st4.braceIdx === -1 || st4.braceIdx === undefined) {
             return { msg: 'expected `{` after `' + st4.kw + '`', line: st4.line, col: st4.col + st4.spanLen, spanLen: 1, label: 'expected a block', hint: 'add `{ ... }` here' };
@@ -224,6 +234,7 @@
     ctx.checkUseSemi = function () {
       var st5 = ctx.current;
       if (st5 && st5.kind === 'use' && !st5.hasSemi) {
+        if (ctx.isCfgGatedOut && ctx.isCfgGatedOut(st5.line, st5.col)) return null;
         return { msg: 'expected `;`, found end of `use` statement', line: st5.line, col: st5.col + 3, spanLen: 1, label: '', hint: 'add `;` here' };
       }
       return null;
@@ -232,11 +243,26 @@
     ctx.checkPrintBang = function () {
       var st6 = ctx.current;
       if (st6 && st6.kind === 'stmt' && st6.sub === 'print-bang') {
+        if (ctx.isCfgGatedOut && ctx.isCfgGatedOut(st6.line, st6.col)) return null;
         var sug = st6.kw === 'vec' ? 'vec![...]' : st6.kw + '!(...)';
         return { msg: 'expected `!` after `' + st6.kw + '` (it is a macro)', line: st6.line, col: st6.col + st6.spanLen, spanLen: 1, label: 'missing `!`', hint: 'write `' + sug + '`' };
       }
       return null;
     };
+
+    // `if` starting a match-guard (`pat if guard => ...`): `=>` appears
+    // before any `{` or `;` ahead. A real statement-`if` always opens `{`.
+    function isMatchGuard(ifIdx) {
+      var toks = ctx.toks, n = toks.length, depth = 0;
+      for (var q = ifIdx + 1; q < Math.min(n, ifIdx + 40); q++) {
+        var w = toks[q].v;
+        if (w === '(' || w === '[') depth++;
+        else if (w === ')' || w === ']') { if (depth > 0) depth--; }
+        else if (depth === 0 && (w === '{' || w === ';')) return false;
+        else if (depth === 0 && w === '=>') return true;
+      }
+      return false;
+    }
 
     // For every `if`, find the `{` that opens its then-block and record it.
     // An `else` is valid only when the token right before it is the `}` that
@@ -262,6 +288,7 @@
       var k = ctx.current;
       var toks = ctx.toks;
       if (k && k.kind === 'kw' && k.kw === 'else') {
+        if (ctx.isCfgGatedOut && ctx.isCfgGatedOut(k.line, k.col)) return null;
         var ok = false;
         if (k.idx > 0 && toks[k.idx - 1].v === '}') {
           // backward brace-match from that `}` to its `{`
@@ -282,6 +309,7 @@
       var st7 = ctx.current;
       var toks = ctx.toks, n = toks.length;
       if (st7 && st7.kind === 'fn' && st7.name) {
+        if (ctx.isCfgGatedOut && ctx.isCfgGatedOut(st7.line, st7.col)) return null;
         // if tokens contain `->` but ret empty/null
         // detect: scan signature region for `->` followed by `{`/`;`
         for (var q4 = st7.idx; q4 < Math.min(n, st7.idx + 40); q4++) {
@@ -319,8 +347,8 @@
 
     ctx.checkMissingMain = function () {
       if (ctx.isLib) return null;
+      // point at EOF / first line
       if (!ctx.hasMain) {
-        // point at EOF / first line
         return { msg: '`main` function not found in crate', line: 1, col: 1, spanLen: 1, label: 'no `main` here', hint: 'add `fn main() { ... }`', note: 'to build a library instead, pass `--lib`' };
       }
       // also validate main signature: no params
@@ -332,6 +360,207 @@
       }
       return null;
     };
+  }
+
+  // ---- host-OS cfg gating shared helper (rustc parity) ----
+  // Same copy as in type_rules.js; first module to attach wins, so rule
+  // files stay independent of load order. Gated-out items are not compiled.
+  function installCfgHelper(ctx) {
+    if (ctx.isCfgGatedOut) return;
+    var host = (function () {
+      try {
+        if (typeof process !== 'undefined' && process && process.platform) {
+          var p = process.platform, arch = null;
+          try {
+            var a = process.arch;
+            if (a === 'x64') arch = 'x86_64';
+            else if (a === 'arm64') arch = 'aarch64';
+            else if (a === 'ia32') arch = 'x86';
+            else if (typeof a === 'string') arch = a;
+          } catch (eA) {}
+          if (p === 'win32') return { os: 'windows', family: 'windows', arch: arch };
+          if (p === 'darwin') return { os: 'macos', family: 'unix', arch: arch };
+          if (p === 'linux') return { os: 'linux', family: 'unix', arch: arch };
+          return { os: null, family: null, arch: arch };
+        }
+      } catch (eH) {}
+      return { os: null, family: null, arch: null };
+    })();
+    var ranges = null;
+    ctx.__cfgHost = host;
+    ctx.isCfgGatedOut = function (line, col) {
+      if (ranges === null) ranges = computeGatedRanges(ctx, host);
+      for (var i = 0; i < ranges.length; i++) {
+        var r = ranges[i];
+        if (line < r.sl || line > r.el) continue;
+        if (line === r.sl && col < r.sc) continue;
+        if (line === r.el && col > r.ec) continue;
+        return true;
+      }
+      return false;
+    };
+  }
+
+  function computeGatedRanges(ctx, host) {
+    var toks = ctx.toks, n = toks.length, out = [];
+    var i = 0;
+    while (i < n - 1) {
+      if (toks[i].v === '#' && toks[i + 1] && toks[i + 1].v === '[') {
+        var close = findCloseX(toks, i + 1, '[', ']');
+        if (close === -1) { i++; continue; }
+        var stack = [{ open: i + 1, close: close }];
+        var j = close + 1;
+        while (j < n - 1 && toks[j].v === '#' && toks[j + 1] && toks[j + 1].v === '[') {
+          var c2 = findCloseX(toks, j + 1, '[', ']');
+          if (c2 === -1) break;
+          stack.push({ open: j + 1, close: c2 });
+          j = c2 + 1;
+        }
+        var itemIdx = skipModsX(toks, j, n);
+        var itemEnd = itemExtentX(toks, itemIdx, n);
+        var gated = false;
+        for (var s = 0; s < stack.length; s++) {
+          var pred = cfgPredToksX(toks, stack[s].open, stack[s].close);
+          if (pred && !evalCfgPredX(pred, host)) { gated = true; break; }
+        }
+        if (gated && itemIdx < n && itemEnd >= itemIdx) {
+          out.push({
+            sl: toks[itemIdx].line, sc: toks[itemIdx].col,
+            el: toks[Math.min(itemEnd, n - 1)].line,
+            ec: toks[Math.min(itemEnd, n - 1)].col + 1
+          });
+        }
+        i = j;
+        continue;
+      }
+      i++;
+    }
+    return out;
+  }
+
+  function skipModsX(toks, j, n) {
+    var k = j, guard = 0;
+    while (k < n && guard++ < 8) {
+      var w = toks[k] && toks[k].v;
+      if (w === 'pub' || w === 'unsafe' || w === 'async' || w === 'const' || w === 'extern') { k++; continue; }
+      if (w === 'crate' && toks[k + 1] && toks[k + 1].v === '(') {
+        var ce = findCloseX(toks, k + 1, '(', ')');
+        k = ce === -1 ? k + 1 : ce + 1;
+        continue;
+      }
+      break;
+    }
+    return k;
+  }
+
+  var CFG_ITEMS_X = {
+    fn: 1, struct: 1, enum: 1, union: 1, mod: 1, static: 1, const: 1,
+    type: 1, use: 1, impl: 1, trait: 1, macro_rules: 1, extern: 1
+  };
+
+  function itemExtentX(toks, from, n) {
+    if (from >= n || !toks[from]) return from;
+    if (!CFG_ITEMS_X[toks[from].v]) return from;
+    for (var k = from + 1; k < Math.min(n, from + 80); k++) {
+      var w = toks[k].v;
+      if (w === ';') return k;
+      if (w === '{') {
+        var e = findCloseX(toks, k, '{', '}');
+        return e === -1 ? k : e;
+      }
+    }
+    return Math.min(n - 1, from + 4);
+  }
+
+  function findCloseX(toks, open, o, c) {
+    var d = 0;
+    for (var k = open; k < toks.length; k++) {
+      if (toks[k].v === o) d++;
+      else if (toks[k].v === c) { d--; if (d === 0) return k; }
+    }
+    return -1;
+  }
+
+  function cfgPredToksX(toks, open, close) {
+    for (var k = open + 1; k < close; k++) {
+      if (toks[k].v === 'cfg' && toks[k + 1] && toks[k + 1].v === '(') {
+        var d = 0, end = -1;
+        for (var q = k + 1; q <= close; q++) {
+          if (toks[q].v === '(') d++;
+          else if (toks[q].v === ')') { d--; if (d === 0) { end = q; break; } }
+        }
+        if (end === -1) return null;
+        return toks.slice(k + 2, end);
+      }
+    }
+    return null;
+  }
+
+  function evalCfgPredX(pred, host) {
+    var pos = 0;
+    function peek() { return pos < pred.length ? pred[pos].v : null; }
+    function parseOr() {
+      var v = parseAtom();
+      while (peek() === ',') { pos++; var rhs = parseAtom(); v = v || rhs; }
+      return v;
+    }
+    function parseAtom() {
+      var w = peek();
+      if (w === 'not' && pred[pos + 1] && pred[pos + 1].v === '(') {
+        pos += 2;
+        var v = parseOr();
+        if (peek() === ')') pos++;
+        return !v;
+      }
+      if ((w === 'any' || w === 'all') && pred[pos + 1] && pred[pos + 1].v === '(') {
+        var isAny = w === 'any';
+        pos += 2;
+        var acc = isAny ? false : true, first = true;
+        while (pos < pred.length && peek() !== ')') {
+          if (peek() === ',') { pos++; continue; }
+          var cv = parseAtom();
+          acc = isAny ? (acc || cv) : (acc && cv);
+          first = false;
+        }
+        if (!first && pos >= pred.length) return acc;
+        if (peek() === ')') pos++;
+        return acc;
+      }
+      var key = w;
+      pos++;
+      if (peek() === '=') {
+        pos++;
+        var val = peek() || '';
+        pos++;
+        if (val.length >= 2 && val[0] === '"' && val[val.length - 1] === '"') {
+          val = val.slice(1, -1);
+        }
+        return evalCfgKeyX(key, val, host);
+      }
+      return evalCfgBareX(key, host);
+    }
+    if (!pred.length) return true;
+    return !!parseOr();
+  }
+
+  function evalCfgBareX(key, host) {
+    if (key === 'test') return false;
+    if (key === 'debug_assertions') return true;
+    if (key === 'doc') return false;
+    if (key === 'unix') return host.family ? host.family === 'unix' : true;
+    if (key === 'windows') return host.family ? host.family === 'windows' : true;
+    if (key === 'linux' || key === 'macos' || key === 'ios' ||
+        key === 'android' || key === 'freebsd' || key === 'openbsd') {
+      return host.os ? host.os === key : true;
+    }
+    return true;
+  }
+
+  function evalCfgKeyX(key, val, host) {
+    if (key === 'target_os') return host.os ? host.os === val : true;
+    if (key === 'target_family') return host.family ? host.family === val : true;
+    if (key === 'target_arch') return host.arch ? host.arch === val : true;
+    return true;
   }
 
   return { RULES: SYNTAX_RULES, attachSyntax: attachSyntax };

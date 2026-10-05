@@ -100,6 +100,17 @@
     shared = shared || {};
     var T = shared.T || { IDENT: 1 };
     var isKw = shared.isKw || function () { return false; };
+    installCfgHelperB(ctx);
+
+    // Gated-out code is not compiled: drop any borrow diagnostic inside it.
+    function cfgKeep(out) {
+      if (!out || !ctx.isCfgGatedOut) return out;
+      var kept = [];
+      for (var f = 0; f < out.length; f++) {
+        if (!ctx.isCfgGatedOut(out[f].line, out[f].col)) kept.push(out[f]);
+      }
+      return kept.length ? kept : null;
+    }
 
     function getModel() {
       if (ctx.__borrow) return ctx.__borrow;
@@ -306,7 +317,7 @@
           break; // first use per move (rustc reports the first, too)
         }
       }
-      return out.length ? out : null;
+      return cfgKeep(out);
     };
 
     ctx.checkBorrowDoubleMut = function () {
@@ -331,7 +342,7 @@
           }
         }
       }
-      return out.length ? out : null;
+      return cfgKeep(out);
     };
 
     ctx.checkBorrowUseDuring = function () {
@@ -426,7 +437,7 @@
           }
         }
       }
-      return out.length ? out : null;
+      return cfgKeep(out);
     };
 
     ctx.checkBorrowMoveWhileBorrowed = function () {
@@ -447,7 +458,7 @@
           }
         }
       }
-      return out.length ? out : null;
+      return cfgKeep(out);
     };
 
     ctx.checkBorrowMutOfImmutable = function () {
@@ -465,7 +476,7 @@
           });
         }
       }
-      return out.length ? out : null;
+      return cfgKeep(out);
     };
 
     ctx.checkBorrowReturnLocal = function () {
@@ -494,7 +505,7 @@
           break;
         }
       }
-      return out.length ? out : null;
+      return cfgKeep(out);
     };
 
   }
@@ -675,6 +686,206 @@
       else if (toks[i].v === close) { d--; if (d === 0) return i; }
     }
     return -1;
+  }
+
+  // ---- host-OS cfg gating shared helper (rustc parity) ----
+  // Same copy as in the other rule files; first module to attach wins.
+  function installCfgHelperB(ctx) {
+    if (ctx.isCfgGatedOut) return;
+    var host = (function () {
+      try {
+        if (typeof process !== 'undefined' && process && process.platform) {
+          var p = process.platform, arch = null;
+          try {
+            var a = process.arch;
+            if (a === 'x64') arch = 'x86_64';
+            else if (a === 'arm64') arch = 'aarch64';
+            else if (a === 'ia32') arch = 'x86';
+            else if (typeof a === 'string') arch = a;
+          } catch (eA) {}
+          if (p === 'win32') return { os: 'windows', family: 'windows', arch: arch };
+          if (p === 'darwin') return { os: 'macos', family: 'unix', arch: arch };
+          if (p === 'linux') return { os: 'linux', family: 'unix', arch: arch };
+          return { os: null, family: null, arch: arch };
+        }
+      } catch (eH) {}
+      return { os: null, family: null, arch: null };
+    })();
+    var ranges = null;
+    ctx.__cfgHost = host;
+    ctx.isCfgGatedOut = function (line, col) {
+      if (ranges === null) ranges = computeGatedRangesB(ctx, host);
+      for (var i = 0; i < ranges.length; i++) {
+        var r = ranges[i];
+        if (line < r.sl || line > r.el) continue;
+        if (line === r.sl && col < r.sc) continue;
+        if (line === r.el && col > r.ec) continue;
+        return true;
+      }
+      return false;
+    };
+  }
+
+  function computeGatedRangesB(ctx, host) {
+    var toks = ctx.toks, n = toks.length, out = [];
+    var i = 0;
+    while (i < n - 1) {
+      if (toks[i].v === '#' && toks[i + 1] && toks[i + 1].v === '[') {
+        var close = findCloseB(toks, i + 1, '[', ']');
+        if (close === -1) { i++; continue; }
+        var stack = [{ open: i + 1, close: close }];
+        var j = close + 1;
+        while (j < n - 1 && toks[j].v === '#' && toks[j + 1] && toks[j + 1].v === '[') {
+          var c2 = findCloseB(toks, j + 1, '[', ']');
+          if (c2 === -1) break;
+          stack.push({ open: j + 1, close: c2 });
+          j = c2 + 1;
+        }
+        var itemIdx = skipModsB(toks, j, n);
+        var itemEnd = itemExtentB(toks, itemIdx, n);
+        var gated = false;
+        for (var s = 0; s < stack.length; s++) {
+          var pred = cfgPredToksB(toks, stack[s].open, stack[s].close);
+          if (pred && !evalCfgPredB(pred, host)) { gated = true; break; }
+        }
+        if (gated && itemIdx < n && itemEnd >= itemIdx) {
+          out.push({
+            sl: toks[itemIdx].line, sc: toks[itemIdx].col,
+            el: toks[Math.min(itemEnd, n - 1)].line,
+            ec: toks[Math.min(itemEnd, n - 1)].col + 1
+          });
+        }
+        i = j;
+        continue;
+      }
+      i++;
+    }
+    return out;
+  }
+
+  function skipModsB(toks, j, n) {
+    var k = j, guard = 0;
+    while (k < n && guard++ < 8) {
+      var w = toks[k] && toks[k].v;
+      if (w === 'pub' || w === 'unsafe' || w === 'async' || w === 'const' || w === 'extern') { k++; continue; }
+      if (w === 'crate' && toks[k + 1] && toks[k + 1].v === '(') {
+        var ce = findCloseB(toks, k + 1, '(', ')');
+        k = ce === -1 ? k + 1 : ce + 1;
+        continue;
+      }
+      break;
+    }
+    return k;
+  }
+
+  var CFG_ITEMS_B = {
+    fn: 1, struct: 1, enum: 1, union: 1, mod: 1, static: 1, const: 1,
+    type: 1, use: 1, impl: 1, trait: 1, macro_rules: 1, extern: 1
+  };
+
+  function itemExtentB(toks, from, n) {
+    if (from >= n || !toks[from]) return from;
+    if (!CFG_ITEMS_B[toks[from].v]) return from;
+    for (var k = from + 1; k < Math.min(n, from + 80); k++) {
+      var w = toks[k].v;
+      if (w === ';') return k;
+      if (w === '{') {
+        var e = findCloseB(toks, k, '{', '}');
+        return e === -1 ? k : e;
+      }
+    }
+    return Math.min(n - 1, from + 4);
+  }
+
+  function findCloseB(toks, open, o, c) {
+    var d = 0;
+    for (var k = open; k < toks.length; k++) {
+      if (toks[k].v === o) d++;
+      else if (toks[k].v === c) { d--; if (d === 0) return k; }
+    }
+    return -1;
+  }
+
+  function cfgPredToksB(toks, open, close) {
+    for (var k = open + 1; k < close; k++) {
+      if (toks[k].v === 'cfg' && toks[k + 1] && toks[k + 1].v === '(') {
+        var d = 0, end = -1;
+        for (var q = k + 1; q <= close; q++) {
+          if (toks[q].v === '(') d++;
+          else if (toks[q].v === ')') { d--; if (d === 0) { end = q; break; } }
+        }
+        if (end === -1) return null;
+        return toks.slice(k + 2, end);
+      }
+    }
+    return null;
+  }
+
+  function evalCfgPredB(pred, host) {
+    var pos = 0;
+    function peek() { return pos < pred.length ? pred[pos].v : null; }
+    function parseOr() {
+      var v = parseAtom();
+      while (peek() === ',') { pos++; var rhs = parseAtom(); v = v || rhs; }
+      return v;
+    }
+    function parseAtom() {
+      var w = peek();
+      if (w === 'not' && pred[pos + 1] && pred[pos + 1].v === '(') {
+        pos += 2;
+        var v = parseOr();
+        if (peek() === ')') pos++;
+        return !v;
+      }
+      if ((w === 'any' || w === 'all') && pred[pos + 1] && pred[pos + 1].v === '(') {
+        var isAny = w === 'any';
+        pos += 2;
+        var acc = isAny ? false : true, first = true;
+        while (pos < pred.length && peek() !== ')') {
+          if (peek() === ',') { pos++; continue; }
+          var cv = parseAtom();
+          acc = isAny ? (acc || cv) : (acc && cv);
+          first = false;
+        }
+        if (!first && pos >= pred.length) return acc;
+        if (peek() === ')') pos++;
+        return acc;
+      }
+      var key = w;
+      pos++;
+      if (peek() === '=') {
+        pos++;
+        var val = peek() || '';
+        pos++;
+        if (val.length >= 2 && val[0] === '"' && val[val.length - 1] === '"') {
+          val = val.slice(1, -1);
+        }
+        return evalCfgKeyB(key, val, host);
+      }
+      return evalCfgBareB(key, host);
+    }
+    if (!pred.length) return true;
+    return !!parseOr();
+  }
+
+  function evalCfgBareB(key, host) {
+    if (key === 'test') return false;
+    if (key === 'debug_assertions') return true;
+    if (key === 'doc') return false;
+    if (key === 'unix') return host.family ? host.family === 'unix' : true;
+    if (key === 'windows') return host.family ? host.family === 'windows' : true;
+    if (key === 'linux' || key === 'macos' || key === 'ios' ||
+        key === 'android' || key === 'freebsd' || key === 'openbsd') {
+      return host.os ? host.os === key : true;
+    }
+    return true;
+  }
+
+  function evalCfgKeyB(key, val, host) {
+    if (key === 'target_os') return host.os ? host.os === val : true;
+    if (key === 'target_family') return host.family ? host.family === val : true;
+    if (key === 'target_arch') return host.arch ? host.arch === val : true;
+    return true;
   }
 
   // `RULES`/`attach` aliases match the other src/rules/*.js modules so the

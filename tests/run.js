@@ -84,6 +84,90 @@ t('&mut param writes back', 'fn bump(n: &mut i32) { *n += 10; } fn main() { let 
 
 console.log('\n' + passed + ' passed, ' + failed + ' failed');
 
+// ---- check-only helper (valid code must COMPILE; no execution) ----
+function tc(name, src, want) {
+  var r = FRS.compile(src, { file: 'main.rs', run: false });
+  var ok = true, why = '';
+  if (want.ok !== undefined && r.compileOk !== want.ok) { ok = false; why = 'compileOk=' + r.compileOk + ' want ' + want.ok; }
+  if (want.errContains && !(r.stderr || '').includes(want.errContains)) { ok = false; why += ' stderr missing ' + JSON.stringify(want.errContains) + ' got:\n' + r.stderr; }
+  if (want.noErr && r.errCount !== 0) { ok = false; why += ' expected 0 errors, got ' + r.errCount + ':\n' + r.stderr; }
+  if (ok) { passed++; console.log('ok - ' + name); }
+  else { failed++; console.log('FAIL - ' + name + ' :: ' + why); }
+}
+
+// ---- valid-Rust acceptance: every prompt.txt-shaped snippet must compile ----
+tc('todo.rs compiles', require('fs').readFileSync(path.join(__dirname, '..', 'examples', 'todo.rs'), 'utf8'), { ok: true });
+tc('Vec::new generic', 'fn main() { let mut todos: Vec<String> = Vec::new(); println!("{}", todos.len()); }', { ok: true });
+tc('vec! annotated', 'fn main() { let v: Vec<i32> = vec![1, 2]; println!("{:?}", v); }', { ok: true });
+tc('Result Ok annotated', 'fn main() { let x: Result<i32, String> = Ok(5); println!("{:?}", x); }', { ok: true });
+tc('Option None annotated', 'fn main() { let x: Option<i32> = None; }', { ok: true });
+tc('HashMap::new generic', 'use std::collections::HashMap; fn main() { let h: HashMap<String, i32> = HashMap::new(); }', { ok: true });
+tc('to_string/len/parse chains', 'fn main() { let s: String = "42".to_string(); let n: usize = "42".parse().unwrap(); let l: usize = s.len(); let e: bool = s.is_empty(); }', { ok: true });
+tc('match guard', 'fn main() { let x = 5; match x { n if n > 3 => println!("big"), _ => println!("small"), } }', { ok: true });
+tc('at-pattern', 'fn main() { let x = 5; match x { n @ 1..=5 => println!("{}", n), _ => {} } }', { ok: true });
+tc('or-pattern', 'fn main() { let x = 1; match x { 1 | 2 => println!("a"), _ => {} } }', { ok: true });
+tc('stringify nested', 'fn main() { println!("{}", stringify!(hi)); }', { ok: true });
+tc('raw ident', 'fn main() { let r#type = 5; println!("{}", r#type); }', { ok: true });
+tc('compound assign ops', 'fn main() { let mut x = 5; x <<= 1; x >>= 1; x &= 3; x |= 1; x ^= 2; println!("{}", x); }', { ok: true });
+tc('ref/deref/move/range ops', 'fn main() { let mut x = 5; let r = &mut x; *r += 1; let y = 1..3; let z = 1..=3; let w = &x; println!("{}{}", x, w); }', { ok: true });
+tc('question mark op', 'fn f() -> Result<i32, String> { Ok(1) } fn g() -> Result<i32, String> { let x = f()?; Ok(x) } fn main() {}', { ok: true });
+tc('lifetimes/generics/where', 'fn f<\'a>(x: &\'a str) -> &\'a str { x } fn g<T>(x: T) -> T where T: Clone { x.clone() } fn main() {}', { ok: true });
+tc('dyn/impl trait', 'trait T {} fn f(x: &dyn T) {} fn g(x: impl Into<i32>) {} fn main() {}', { ok: true });
+tc('desktop callback use', 'fn app() -> String { String::from("hi") } fn main() { dioxus::launch(app); }', { ok: true });
+tc('desktop winit', 'use winit::event_loop::EventLoop; fn main() { println!("gui"); }', { ok: true });
+tc('allow dead_code', '#[allow(dead_code)] fn helper() {} fn main() {}', { ok: true });
+
+// ---- OS-aware compilation (rustc parity): false cfg is not compiled ----
+(function () {
+  var plat = typeof process !== 'undefined' ? process.platform : '';
+  var hostOs = plat === 'win32' ? 'windows' : (plat === 'darwin' ? 'macos' : 'linux');
+  var otherOs = hostOs === 'windows' ? 'linux' : 'windows';
+  tc('cfg(false-os) not compiled', '#[cfg(target_os = "' + otherOs + '")] fn gated_broken() { let x: i32 = "bad"; } fn main() {}', { ok: true });
+  t('cfg(true-os) runs', '#[cfg(target_os = "' + hostOs + '")] fn plat() -> i32 { 41 } fn main() { println!("{}", plat()); }', { ok: true, stdout: '41\n' });
+  tc('cfg(not/any/all)', '#[cfg(not(target_os = "' + otherOs + '"))] fn a() {} #[cfg(any(target_os = "' + otherOs + '", target_os = "' + hostOs + '"))] fn b() {} #[cfg(all(unix, not(target_os = "' + otherOs + '")))] fn c() {} fn main() { a(); b(); }', { ok: true });
+  t('cfg! macro host', 'fn main() { println!("{}", cfg!(target_os = "' + hostOs + '")); }', { ok: true, stdout: 'true\n' });
+  t('consts::OS host', 'fn main() { println!("{}", std::env::consts::OS); }', { ok: true, stdout: hostOs + '\n' });
+})();
+
+// ---- runtime semantics for everyday valid code ----
+t('range inclusive run', 'fn main() { for i in 1..=3 { print!("{}", i); } }', { ok: true, stdout: '123' });
+t('match block arms', 'fn main() { let mut i = 0; loop { i += 1; match i { 3 => { println!("three"); break; } _ => println!("n={}", i), } } }', { ok: true, stdout: 'n=1\nn=2\nthree\n' });
+t('or-pattern runs', 'fn main() { let x = 5; match x { 1 | 2 => println!("low"), _ => println!("other"), } }', { ok: true, stdout: 'other\n' });
+t('at-pattern binds', 'fn main() { let x = 5; match x { n @ 3..=6 if n > 4 => println!("mid {}", n), _ => println!("other"), } }', { ok: true, stdout: 'mid 5\n' });
+t('same-name &mut writes back', 'fn add(n: &mut usize) { *n += 1; } fn main() { let mut n: usize = 1; add(&mut n); add(&mut n); println!("{}", n); }', { ok: true, stdout: '3\n' });
+t('struct field write', 'struct P { x: i32 } fn main() { let mut p = P { x: 1 }; p.x = 5; println!("{}", p.x); }', { ok: true, stdout: '5\n' });
+t('tuple index', 'fn main() { let t = (1, "hi"); println!("{} {}", t.0, t.1); }', { ok: true, stdout: '1 hi\n' });
+t('as cast', 'fn main() { let x = 5 as f64; println!("{}", x); }', { ok: true, stdout: '5\n' });
+t('find/retain/iter_mut', 'struct T { id: usize } fn main() { let mut v = vec![T { id: 1 }, T { id: 2 }]; if let Some(t) = v.iter_mut().find(|x| x.id == 2) { t.id = 9; } v.retain(|x| x.id != 1); println!("{} {}", v.len(), v[0].id); }', { ok: true, stdout: '1 9\n' });
+t('move closure captures', 'fn main() { let v = vec![1]; let f = move || v.len(); println!("{}", f()); }', { ok: true, stdout: '1\n' });
+t('format precision', 'fn main() { println!("{:.1}", 3.14159); }', { ok: true, stdout: '3.1\n' });
+t('negated field assign', 'struct T { on: bool } fn main() { let mut t = T { on: false }; t.on = !t.on; println!("{}", t.on); }', { ok: true, stdout: 'true\n' });
+
+console.log('\n' + passed + ' passed, ' + failed + ' failed (incl. acceptance)');
+
+// ---- interactive terminal input: prompts flush live, reads block per line ----
+// (spawns a child that fakes TTY flags with piped keystrokes standing in for
+// typed lines — byte-wise reads behave identically on a real terminal)
+(function () {
+  try {
+    var cp = require('child_process');
+    var frsPath = path.join(__dirname, '..', 'src', 'frs.js');
+    var todoPath = path.join(__dirname, '..', 'examples', 'todo.rs');
+    var helper = "process.stdin.isTTY=true;process.stdout.isTTY=true;" +
+      "var FRS=require(" + JSON.stringify(frsPath) + ");" +
+      "var fs=require('fs');" +
+      "var src=fs.readFileSync(" + JSON.stringify(todoPath) + ",'utf8');" +
+      "var r=FRS.compile(src,{file:'todo.rs',run:true});" +
+      "process.stdout.write('\\n[END ok='+r.compileOk+' tail='+JSON.stringify(r.stdout.slice(-20))+']');";
+    var res = cp.spawnSync(process.execPath, ['-e', helper], { input: '2\nBuy milk\n1\n6\n', timeout: 20000, encoding: 'utf8' });
+    var out = (res.stdout || '') + (res.stderr || '');
+    var okTty = res.status === 0 && out.indexOf('Choose an option') !== -1 &&
+      out.indexOf('Buy milk') !== -1 && out.indexOf('Goodbye!') !== -1;
+    if (okTty) { passed++; console.log('ok - interactive tty input'); }
+    else { failed++; console.log('FAIL - interactive tty input :: status=' + res.status + ' err=' + (res.error && res.error.message) + ' out=' + JSON.stringify(out.slice(-300))); }
+  } catch (e) { failed++; console.log('FAIL - interactive tty input threw: ' + e.message); }
+})();
+
 // ---- browser compat: load every src/*.js in a `module`-less vm sandbox ----
 (function () {
   try {
